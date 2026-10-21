@@ -4,8 +4,13 @@ setlocal EnableExtensions DisableDelayedExpansion
 if not defined PIXI_PROJECT_ROOT goto :not_in_pixi
 if not defined CONDA_PREFIX goto :not_in_pixi
 
-set "ACADOS_ROOT=%PIXI_PROJECT_ROOT%\acados"
-set "ACADOS_BUILD=%ACADOS_ROOT%\build-windows"
+rem GCC's subprocess search breaks on spaces in its installation prefix.
+for %%I in ("%PIXI_PROJECT_ROOT%") do set "ACADOS_PROJECT=%%~sI"
+for %%I in ("%CONDA_PREFIX%") do set "ACADOS_PREFIX=%%~sI"
+set "ACADOS_PREFIX=%ACADOS_PREFIX:\=/%"
+set "PATH=%ACADOS_PREFIX%\Library\bin;%PATH%"
+set "ACADOS_ROOT=%ACADOS_PROJECT%\acados"
+set "ACADOS_BUILD=%ACADOS_ROOT%\build-windows-short"
 set "ACADOS_PYTHON=%CONDA_PREFIX%\python.exe"
 set "ACADOS_INTERFACE=%ACADOS_ROOT%\interfaces\acados_template"
 set "ACADOS_RENDERER=%ACADOS_ROOT%\bin\t_renderer.exe"
@@ -15,6 +20,8 @@ if not exist "%ACADOS_PYTHON%" (
     echo [Setup Acados] ERROR: Pixi Python not found. 1>&2
     goto :failed
 )
+"%ACADOS_PYTHON%" "%PIXI_PROJECT_ROOT%\tools\fix_windows_gcc.py"
+if errorlevel 1 goto :failed
 for %%T in (git cmake gcc g++ mingw32-make) do (
     where %%T >nul 2>&1
     if errorlevel 1 (
@@ -47,8 +54,10 @@ echo [Setup Acados] Building Windows shared libraries...
 git -C "%ACADOS_ROOT%" submodule update --init --recursive
 if errorlevel 1 goto :failed
 rem Python needs shared libraries. The example MPC uses HPIPM, not qpOASES.
-cmake -S "%ACADOS_ROOT%" -B "%ACADOS_BUILD%" ^
+cmake --fresh -S "%ACADOS_ROOT%" -B "%ACADOS_BUILD%" ^
     -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release ^
+    "-DCMAKE_C_COMPILER=%ACADOS_PREFIX%/Library/bin/gcc.exe" ^
+    "-DCMAKE_CXX_COMPILER=%ACADOS_PREFIX%/Library/bin/g++.exe" ^
     "-DACADOS_INSTALL_DIR=%ACADOS_ROOT%" ^
     -DBUILD_SHARED_LIBS=ON -DBLASFEO_TARGET=GENERIC ^
     -DHPIPM_TARGET=GENERIC -DACADOS_WITH_QPOASES=OFF

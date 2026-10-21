@@ -36,3 +36,31 @@ python scripts/sim.py --config level3.toml --controller my_controller.py
 
 !!! note
     You can also write your controller file directly into the config files located in the `config` folder. That way, you don't need to specify the controller script when running the simulation, and the controller will be used in the automated challenge evaluation.
+
+## Level 2 MPC
+
+`config/level2.toml` selects `level2_mpc.py` with the attitude interface. Run it with:
+
+```powershell
+pixi run python scripts/sim.py --config level2.toml
+```
+
+Use `--render=False` for a run without graphics, or `pixi run evaluate` for the
+competition's 20-episode evaluation. The controller implements the `Controller`
+interface in a separate file; `control/controller.py` remains the common base class.
+
+The controller uses the supplied acados nonlinear drone model with a one-second,
+25-stage prediction horizon. It replans from sensor observations, respects signed
+gate order, routes around obstacles and gate frames, and clears each frame before
+turning toward the next gate. Clearance is enforced by the route planner rather
+than hard collision constraints inside the MPC, so randomized races can still fail.
+
+On Windows, Pixi activation builds acados and repairs GCC specs that contain an
+unquoted installation path with spaces. The first run compiles the generated solver;
+subsequent episodes in the same process reuse its DLL.
+
+Local Windows CPU validation: the 20-race evaluation completed 19 races successfully
+(95%), averaging 25.74 seconds over successful races. Seeds 1337, 42 and 7 completed
+in 27.12, 26.16 and 24.80 seconds respectively. Five planner regression tests pass.
+These are baseline measurements, not a guarantee for future random seeds. Some
+geometry replans exceed the 20 ms control period.

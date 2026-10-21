@@ -9,6 +9,7 @@ Note that the trajectory uses pre-defined waypoints instead of dynamically gener
 
 from __future__ import annotations  # Python 3.10 type hints
 
+import hashlib
 import os
 from typing import TYPE_CHECKING
 
@@ -26,6 +27,8 @@ from lsy_drone_racing.control import Controller
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+_built_solvers: set[str] = set()
 
 
 def create_acados_model(parameters: dict) -> AcadosModel:
@@ -57,6 +60,11 @@ def create_ocp_solver(
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Creates an acados Optimal Control Problem and Solver."""
     ocp = AcadosOcp()
+    # Reuse generated libraries within a process: Windows cannot overwrite a DLL
+    # while a previous episode's solver still holds it open.
+    signature = repr((Tf, N, parameters)).encode()
+    solver_key = hashlib.sha256(signature).hexdigest()[:16]
+    ocp.code_export_directory = os.path.abspath(f"c_generated_code/mpc_{solver_key}")
 
     # Set model
     ocp.model = create_acados_model(parameters)
@@ -166,12 +174,13 @@ def create_ocp_solver(
 
     acados_ocp_solver = AcadosOcpSolver(
         ocp,
-        json_file="c_generated_code/lsy_example_mpc.json",
+        json_file=os.path.join(ocp.code_export_directory, "ocp.json"),
         verbose=verbose,
-        build=True,
-        generate=True,
+        build=solver_key not in _built_solvers,
+        generate=solver_key not in _built_solvers,
         cmake_builder=cmake_builder,
     )
+    _built_solvers.add(solver_key)
 
     return acados_ocp_solver, ocp
 
