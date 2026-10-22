@@ -49,18 +49,38 @@ Use `--render=False` for a run without graphics, or `pixi run evaluate` for the
 competition's 20-episode evaluation. The controller implements the `Controller`
 interface in a separate file; `control/controller.py` remains the common base class.
 
-The controller uses the supplied acados nonlinear drone model with a one-second,
-25-stage prediction horizon. It replans from sensor observations, respects signed
-gate order, routes around obstacles and gate frames, and clears each frame before
-turning toward the next gate. Clearance is enforced by the route planner rather
-than hard collision constraints inside the MPC, so randomized races can still fail.
+The racing profile uses the supplied acados nonlinear drone model with a 0.8-second,
+20-stage prediction horizon. A continuous quintic reference carries velocity through
+gate crossings, with attitude and acceleration feedforward. The controller replans
+from public sensor observations and adds soft constraints for the current signed
+gate opening. Sampled obstacle and frame clearance remains a planning heuristic,
+so randomized races can still fail. The simulator, track, and competition scripts
+are unchanged.
+
+`Level2MPC.TIME_SCALE` controls the trajectory duration: a smaller value requests
+faster motion and can sharply reduce reliability. `Level2MPC.RACING = False`
+restores the conservative visibility-graph planner and original MPC settings.
 
 On Windows, Pixi activation builds acados and repairs GCC specs that contain an
 unquoted installation path with spaces. The first run compiles the generated solver;
 subsequent episodes in the same process reuse its DLL.
 
-Local Windows CPU validation: the 20-race evaluation completed 19 races successfully
-(95%), averaging 25.74 seconds over successful races. Seeds 1337, 42 and 7 completed
-in 27.12, 26.16 and 24.80 seconds respectively. Five planner regression tests pass.
-These are baseline measurements, not a guarantee for future random seeds. Some
-geometry replans exceed the 20 ms control period.
+Local Windows CPU validation with the unchanged 20-race evaluator:
+
+| Profile | Mean successful lap | Finished races |
+| --- | ---: | ---: |
+| Original conservative planner | 25.74 s | 19/20 (95%) |
+| Racing, `TIME_SCALE = 1.8` (default) | 8.30 s | 14/20 (70%) |
+| Racing, `TIME_SCALE = 1.6` | approximately 7.4 s | 9/20 (45%, fails threshold) |
+| Racing, `TIME_SCALE = 1.4` | approximately 6.5 s | 6/20 (30%, fails threshold) |
+
+The default reduces the measured mean successful lap time by approximately 68%,
+but gives up reliability. Three-second laps have **not** been achieved. Faster
+settings are experimental and did not pass the required 50% success threshold.
+These local results are not a guarantee for future randomized races.
+
+Ten planner and gate-corridor regression tests pass. Sensor-triggered trajectory
+optimization sometimes exceeds the 20 ms control period by over a second;
+initial trajectory optimization also takes several seconds. The lap times above
+are simulated flight times, not wall-clock execution times. This profile needs
+further work before use with a physical drone or strict real-time execution.

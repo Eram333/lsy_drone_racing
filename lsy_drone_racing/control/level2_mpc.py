@@ -1,10 +1,11 @@
 """Observation-based gate planning with nonlinear attitude MPC for level 2.
 
-The planner approaches each gate along its signed local x axis, then crosses its
-centre. A visibility graph routes transit segments around observed obstacles and
-gate frames. Geometry is refreshed every control step, including when a previously
-unseen object enters sensor range. Collision clearance is a planning heuristic,
-not a hard constraint on the nonlinear MPC prediction.
+The racing planner builds a continuous quintic trajectory through signed gate
+crossings, updates it from public sensor observations, and supplies position,
+velocity and attitude references to the acados MPC. Soft prediction constraints
+encourage crossing the current gate opening. Sampled obstacle clearance remains
+a planning heuristic; randomized races can still fail. The conservative
+visibility-graph planner is available with RACING=False.
 """
 
 from __future__ import annotations
@@ -93,19 +94,23 @@ def sample_path(path: NDArray, times: NDArray, speed: float) -> tuple[NDArray, N
 class Level2MPC(Controller):
     """Replan gate approaches online and track them with an acados nonlinear MPC."""
 
+    RACING = True
+    TIME_SCALE = 1.8
+
     def __init__(self, obs: dict, info: dict, config: dict):
         """Build the dynamics solver and initialize race progress."""
         super().__init__(obs, info, config)
         if config.env.control_mode != "attitude":
             raise ValueError("level2_mpc.py requires env.control_mode = 'attitude'")
         self._dt = 1 / config.env.freq
-        self._N = 25
+        self._N = 20 if self.RACING else 25
         self._prediction_dt = 0.04
         self._params = load_params(Dynamics.so_rpy, config.sim.drone)
         self._solver, self._ocp = create_ocp_solver(
-            self._N * self._prediction_dt, self._N, self._params
+            self._N * self._prediction_dt, self._N, self._params, racing=self.RACING
         )
         self._hover = float(self._params["mass"] * -self._params["gravity_vec"][-1])
+        self._nx = self._ocp.model.x.rows()
         self._thrust_bias = 0.0
         self._gate = -1
         self._crossing = False
@@ -115,9 +120,21 @@ class Level2MPC(Controller):
         self._geometry = None
         self._exit = None
         self._previous_gate_geometry = None
+        self._gate_constraint_stage = None
+        self._trajectory = None
+        if self.RACING:
+            from lsy_drone_racing.control.racing_trajectory import RaceTrajectory
+
+            self._trajectory = RaceTrajectory(obs, time_scale=self.TIME_SCALE)
 
     def _reference(self, obs: dict) -> tuple[NDArray, NDArray]:
         """Plan from available sensor observations without reading simulator state."""
+        if getattr(self, "_trajectory", None) is not None:
+            times = np.arange(self._N + 1) * self._prediction_dt
+            positions, velocities, self._reference_acceleration = self._trajectory.sample(
+                obs, times
+            )
+            return positions, velocities
         pos = np.asarray(obs["pos"], dtype=float)
         progress = int(obs["n_gates_passed"])
         if progress >= len(obs["gate_sequence"]):
@@ -217,6 +234,22 @@ class Level2MPC(Controller):
         self._solver.set(0, "lbx", state)
         self._solver.set(0, "ubx", state)
         positions, velocities = self._reference(obs)
+        if self.RACING:
+            self._set_gate_corridor(obs)
+        reference_rpy = np.zeros((self._N + 1, 3))
+        reference_rates = np.zeros_like(reference_rpy)
+        reference_thrust = np.full(self._N + 1, self._hover)
+        if self.RACING:
+            forces = self._reference_acceleration + [0, 0, 9.81]
+            reference_thrust = np.linalg.norm(forces, axis=1) * self._params["mass"]
+            z_axis = forces / np.maximum(np.linalg.norm(forces, axis=1, keepdims=True), 1e-9)
+            y_axis = np.cross(z_axis, np.array([1, 0, 0]))
+            y_axis /= np.maximum(np.linalg.norm(y_axis, axis=1, keepdims=True), 1e-9)
+            x_axis = np.cross(y_axis, z_axis)
+            reference_rpy = Rotation.from_matrix(
+                np.stack([x_axis, y_axis, z_axis], axis=-1)
+            ).as_euler("xyz")
+            reference_rates = np.gradient(reference_rpy, self._prediction_dt, axis=0)
         # Slow integral trim compensates for randomized mass and steady vertical disturbance.
         self._thrust_bias = float(
             np.clip(
@@ -224,14 +257,19 @@ class Level2MPC(Controller):
             )
         )
         for stage in range(self._N):
-            reference = np.zeros(16)
+            reference = np.zeros(self._nx + 4)
             reference[:3] = positions[stage]
+            reference[3:6] = reference_rpy[stage]
             reference[6:9] = velocities[stage]
-            reference[15] = self._hover + self._thrust_bias
+            reference[9:12] = reference_rates[stage]
+            reference[self._nx : self._nx + 3] = reference_rpy[stage]
+            reference[self._nx + 3] = reference_thrust[stage] + self._thrust_bias
             self._solver.set(stage, "yref", reference)
-        terminal = np.zeros(12)
+        terminal = np.zeros(self._nx)
         terminal[:3] = positions[-1]
+        terminal[3:6] = reference_rpy[-1]
         terminal[6:9] = velocities[-1]
+        terminal[9:12] = reference_rates[-1]
         self._solver.set(self._N, "yref", terminal)
         status = self._solver.solve()
         action = self._solver.get(0, "u")
@@ -246,6 +284,40 @@ class Level2MPC(Controller):
             np.float32
         )
 
+    def _set_gate_corridor(self, obs: dict) -> None:
+        """Require the prediction to pass through the current observed gate opening."""
+        if self._gate_constraint_stage is not None:
+            self._solver.constraints_set(self._gate_constraint_stage, "lg", np.full(4, -1e4))
+            self._solver.constraints_set(self._gate_constraint_stage, "ug", np.full(4, 1e4))
+        progress = int(obs["n_gates_passed"])
+        if progress >= len(obs["gate_sequence"]):
+            return
+        index = int(obs["gate_sequence"][progress])
+        centre = np.asarray(obs["gates_pos"][index], dtype=float)
+        rotation = Rotation.from_quat(obs["gates_quat"][index]).as_matrix()
+        normal = rotation[:, 0] * int(obs["gate_sequence_direction"][progress])
+        distance = max(0.0, -(np.asarray(obs["pos"]) - centre) @ normal)
+        remaining = float(
+            np.sum(self._trajectory._variables[: progress + 1]) - self._trajectory._time
+        )
+        deadline = max(remaining, 0.2, np.sqrt(2 * distance / 8))
+        if deadline > (self._N - 1) * self._prediction_dt:
+            self._gate_constraint_stage = None
+            return
+        stage = int(np.clip(np.ceil(deadline / self._prediction_dt), 1, self._N - 1))
+        matrix = np.zeros((4, getattr(self, "_nx", 12)))
+        matrix[0, :3] = normal
+        matrix[1, :3] = rotation[:, 1]
+        matrix[2, :3] = rotation[:, 2]
+        matrix[3, 6:9] = normal
+        projected = matrix[:3, :3] @ centre
+        lower = np.r_[projected + [0.06, -0.09, -0.09], 0.3]
+        upper = np.r_[projected + [0.3, 0.09, 0.09], 5.0]
+        self._solver.constraints_set(stage, "C", matrix, api="new")
+        self._solver.constraints_set(stage, "lg", lower)
+        self._solver.constraints_set(stage, "ug", upper)
+        self._gate_constraint_stage = stage
+
     def step_callback(
         self,
         action: NDArray,
@@ -257,4 +329,6 @@ class Level2MPC(Controller):
     ) -> bool:
         """Continue until the environment ends the race or repeated solver failures occur."""
         self._tick += 1
+        if self._trajectory is not None:
+            self._trajectory._time += self._dt
         return bool(terminated or truncated or self._failures >= 25)
