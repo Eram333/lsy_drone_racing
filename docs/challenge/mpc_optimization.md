@@ -26,7 +26,9 @@ alone explains every central failure.
 
 After the cache correction, the unchanged 20-race evaluator with
 `TIME_SCALE = 1.8` finished 15/20 races (75%), with a mean successful lap of
-8.38 seconds. This is a fresh randomized batch, not a paired comparison with
+8.38 seconds. A separate batch at `TIME_SCALE = 1.4` completed 12/20 races
+(60%) with a mean successful lap of 6.50 seconds. The default remains 1.8
+for greater reliability margin. These are fresh randomized batches, not paired comparisons with
 the earlier 70% batch. It is a local pass, not a verified central pass.
 
 ## Selected experiments

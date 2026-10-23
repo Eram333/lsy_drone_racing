@@ -30,9 +30,10 @@ class TestRacingTrajectory(unittest.TestCase):
         planner._variables = np.r_[1.0, 1.0, np.zeros(5)]
         result = SimpleNamespace(x=planner._variables.copy(), fun=0.0, success=True)
         module = "lsy_drone_racing.control.racing_trajectory"
-        with patch.dict(f"{module}._plan_cache", clear=True), patch(
-            f"{module}.minimize", return_value=result
-        ) as optimize:
+        with (
+            patch.dict(f"{module}._plan_cache", clear=True),
+            patch(f"{module}.minimize", return_value=result) as optimize,
+        ):
             planner._optimize()
             planner._optimize()
             self.assertEqual(optimize.call_count, 1)
