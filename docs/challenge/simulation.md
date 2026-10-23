@@ -49,7 +49,12 @@ Use `--render=False` for a run without graphics, or `pixi run evaluate` for the
 competition's 20-episode evaluation. The controller implements the `Controller`
 interface in a separate file; `control/controller.py` remains the common base class.
 
-The racing profile uses the supplied acados nonlinear drone model with a 0.8-second,
+The submitted default currently uses the conservative visibility-graph planner
+(`Level2MPC.RACING = False`) because the faster profile failed central flight
+evaluation. The conservative profile previously achieved 25.46 s with 90% success
+in the central competition. The three-second goal remains unachieved.
+
+The experimental racing profile uses the supplied acados nonlinear drone model with a 0.8-second,
 20-stage prediction horizon. A continuous quintic reference carries velocity through
 gate crossings, with attitude and acceleration feedforward. The controller replans
 from public sensor observations and adds soft constraints for the current signed
@@ -59,7 +64,8 @@ are unchanged.
 
 `Level2MPC.TIME_SCALE` controls the trajectory duration: a smaller value requests
 faster motion and can sharply reduce reliability. `Level2MPC.RACING = False`
-restores the conservative visibility-graph planner and original MPC settings.
+selects the conservative visibility-graph planner and original MPC settings.
+Set it to `True` only to experiment with the faster profile.
 
 On Windows, Pixi activation builds acados and repairs GCC specs that contain an
 unquoted installation path with spaces. The first run compiles the generated solver;
@@ -71,11 +77,11 @@ Local Windows CPU validation with the unchanged 20-race evaluator:
 | --- | ---: | ---: |
 | Original conservative planner | 25.74 s | 19/20 (95%) |
 | Racing, `TIME_SCALE = 1.8` (initial local result) | 8.30 s | 14/20 (70%) |
-| Racing, initial-state-aware cache (default) | 8.38 s | 15/20 (75%) |
+| Racing, initial-state-aware cache (experimental) | 8.38 s | 15/20 (75%) |
 | Racing, `TIME_SCALE = 1.6` | approximately 7.4 s | 9/20 (45%, fails threshold) |
 | Racing, `TIME_SCALE = 1.4` | approximately 6.5 s | 6/20 (30%, fails threshold) |
 
-The default reduces the measured mean successful lap time by approximately 67%,
+The experimental profile reduces the measured mean successful lap time by approximately 67%,
 but gives up reliability. Three-second laps have **not** been achieved. Faster
 settings are experimental and did not pass the required 50% success threshold.
 These local results are not a guarantee for future randomized races.
@@ -88,7 +94,9 @@ further work before use with a physical drone or strict real-time execution.
 
 The initial fast submission subsequently failed its central competition flight
 check (5/20 finishes), despite passing the protected-file and registration checks.
-The default now includes a cache-key correction so a trajectory is reused only
+The experimental racing planner includes a cache-key correction so a trajectory is reused only
 for matching initial position and velocity as well as matching geometry. Its
-75% result above is local; a central pass must be verified separately. See the
+75% result above is local. Two subsequent central evaluations finished only
+9/20 races each (45%); the board was not updated. The conservative profile is
+therefore restored as the submitted default. See the
 [optimization notes](mpc_optimization.md) for the tested strategies and limitations.

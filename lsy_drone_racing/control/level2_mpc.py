@@ -94,7 +94,7 @@ def sample_path(path: NDArray, times: NDArray, speed: float) -> tuple[NDArray, N
 class Level2MPC(Controller):
     """Replan gate approaches online and track them with an acados nonlinear MPC."""
 
-    RACING = True
+    RACING = False
     TIME_SCALE = 1.8
 
     def __init__(self, obs: dict, info: dict, config: dict):
