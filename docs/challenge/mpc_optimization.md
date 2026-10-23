@@ -33,8 +33,12 @@ without changing flight behavior.
 The reproduced seed-4 collision is fixed, but a different screening seed failed;
 this is not a claim of universal improvement on every initial state. The complete
 [per-race results](mpc_reliability_results.csv) include failures. All 12 relevant
-unit tests and both Ruff checks pass. Central competition validation is required
-before promoting this candidate to the passing `main` branch.
+unit tests and both Ruff checks pass. Central competition validation of controller commit `0bb30db` subsequently
+finished **17/20 races (85%)**, with a mean successful lap of **8.47765 s**.
+The leaderboard was updated. This confirms the fast MPC now passes the actual
+competition server; failures remain possible.
+
+[Central evaluation](https://github.com/learnsyslab/lsy_drone_racing/actions/runs/39978593607).
 
 ## Submission verification
 

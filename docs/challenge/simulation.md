@@ -58,9 +58,10 @@ Local reliability screening of this revision: 18/20 finishes (90%) and 8.59 s
 mean successful lap on seeds 100 through 119. These are simulated flight times
 and a held-out local screening, not a guarantee of central evaluation success.
 See [optimization notes](mpc_optimization.md) and
-[per-race results](mpc_reliability_results.csv). The unchanged competition workflow
-is used to verify a candidate on the supported `master` branch before promoting
-it to `main`.
+[per-race results](mpc_reliability_results.csv). The unchanged competition workflow verified controller commit `0bb30db` on the
+supported `master` branch before promotion: **17/20 finishes (85%) and 8.48 s**
+mean successful lap on the competition server. See the
+[central evaluation](https://github.com/learnsyslab/lsy_drone_racing/actions/runs/39978593607).
 
 The racing profile uses the supplied acados nonlinear drone model with a 0.8-second,
 20-stage prediction horizon. A continuous quintic reference carries velocity through
