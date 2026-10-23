@@ -43,6 +43,12 @@ class TestRacingTrajectory(unittest.TestCase):
             planner._start_velocity[1] += 0.1
             planner._optimize()
             self.assertEqual(optimize.call_count, 3)
+            planner.FRAME_CLEARANCE += 0.01
+            planner._optimize()
+            self.assertEqual(optimize.call_count, 4)
+            planner.POLE_CLEARANCE += 0.01
+            planner._optimize()
+            self.assertEqual(optimize.call_count, 5)
 
     def test_endpoint_derivatives(self):
         """Quintics must honor position, velocity and acceleration in physical time."""

@@ -11,6 +11,7 @@ visibility-graph planner is available with RACING=False.
 from __future__ import annotations
 
 import heapq
+import json
 import logging
 from typing import TYPE_CHECKING
 
@@ -26,6 +27,12 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
+
+
+def collective_thrust_reference(accelerations: NDArray, parameters: dict) -> NDArray:
+    """Invert the prediction model's calibrated force-to-command mapping."""
+    forces = parameters["mass"] * np.linalg.norm(accelerations - parameters["gravity_vec"], axis=-1)
+    return (forces - parameters["acc_coef"]) / parameters["cmd_f_coef"]
 
 
 def segment_clear(a: NDArray, b: NDArray, centres: NDArray, radii: NDArray) -> bool:
@@ -94,7 +101,7 @@ def sample_path(path: NDArray, times: NDArray, speed: float) -> tuple[NDArray, N
 class Level2MPC(Controller):
     """Replan gate approaches online and track them with an acados nonlinear MPC."""
 
-    RACING = False
+    RACING = True
     TIME_SCALE = 1.8
 
     def __init__(self, obs: dict, info: dict, config: dict):
@@ -110,6 +117,8 @@ class Level2MPC(Controller):
             self._N * self._prediction_dt, self._N, self._params, racing=self.RACING
         )
         self._hover = float(self._params["mass"] * -self._params["gravity_vec"][-1])
+        if self.RACING:
+            self._hover = float(collective_thrust_reference(np.zeros((1, 3)), self._params)[0])
         self._nx = self._ocp.model.x.rows()
         self._thrust_bias = 0.0
         self._gate = -1
@@ -122,6 +131,8 @@ class Level2MPC(Controller):
         self._previous_gate_geometry = None
         self._gate_constraint_stage = None
         self._trajectory = None
+        self._last_observation = None
+        self._last_reference_position = None
         if self.RACING:
             from lsy_drone_racing.control.racing_trajectory import RaceTrajectory
 
@@ -228,20 +239,24 @@ class Level2MPC(Controller):
 
     def compute_control(self, obs: dict, info: dict | None = None) -> NDArray:
         """Solve the finite-horizon tracking problem and apply its first input."""
+        self._last_observation = obs
         rpy = Rotation.from_quat(obs["quat"]).as_euler("xyz")
         rates = np.asarray(ang_vel2rpy_rates(obs["quat"], obs["ang_vel"]), dtype=float)
         state = np.concatenate([obs["pos"], rpy, obs["vel"], rates]).astype(float)
         self._solver.set(0, "lbx", state)
         self._solver.set(0, "ubx", state)
         positions, velocities = self._reference(obs)
+        self._last_reference_position = positions[0].copy()
         if self.RACING:
             self._set_gate_corridor(obs)
         reference_rpy = np.zeros((self._N + 1, 3))
         reference_rates = np.zeros_like(reference_rpy)
         reference_thrust = np.full(self._N + 1, self._hover)
         if self.RACING:
-            forces = self._reference_acceleration + [0, 0, 9.81]
-            reference_thrust = np.linalg.norm(forces, axis=1) * self._params["mass"]
+            forces = self._reference_acceleration - self._params["gravity_vec"]
+            reference_thrust = collective_thrust_reference(
+                self._reference_acceleration, self._params
+            )
             z_axis = forces / np.maximum(np.linalg.norm(forces, axis=1, keepdims=True), 1e-9)
             y_axis = np.cross(z_axis, np.array([1, 0, 0]))
             y_axis /= np.maximum(np.linalg.norm(y_axis, axis=1, keepdims=True), 1e-9)
@@ -331,4 +346,34 @@ class Level2MPC(Controller):
         self._tick += 1
         if self._trajectory is not None:
             self._trajectory._time += self._dt
-        return bool(terminated or truncated or self._failures >= 25)
+        finished = bool(terminated or truncated or self._failures >= 25)
+        if (
+            self.RACING
+            and finished
+            and int(obs["n_gates_passed"]) < len(obs["gate_sequence"])
+            and self._last_observation is not None
+        ):
+            self._report_failure(obs)
+        return finished
+
+    def _report_failure(self, obs: dict) -> None:
+        """Expose last valid flight geometry in local logs and CI annotations."""
+        previous = self._last_observation
+        position = np.asarray(previous["pos"])
+        local = np.einsum(
+            "gi,gij->gj",
+            position - previous["gates_pos"],
+            Rotation.from_quat(previous["gates_quat"]).as_matrix(),
+        )
+        distance = np.linalg.norm(np.maximum(np.abs(local) - [0.018, 0.36, 0.36], 0), axis=1)
+        closest = int(np.argmin(distance))
+        report = {
+            "time": round(self._tick * self._dt, 3),
+            "gates_passed": int(obs["n_gates_passed"]),
+            "closest_gate": closest,
+            "local_position": np.round(local[closest], 3).tolist(),
+            "velocity": np.round(previous["vel"], 3).tolist(),
+            "reference_error": np.round(self._last_reference_position - position, 3).tolist(),
+            "solver_failures": self._failures,
+        }
+        print(f"::notice title=MPC flight failure::{json.dumps(report)}", flush=True)

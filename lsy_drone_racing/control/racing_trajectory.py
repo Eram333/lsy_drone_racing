@@ -63,6 +63,8 @@ class RaceTrajectory:
 
     FORCE_LIMIT = 15.0
     JERK_WEIGHT = 0.00003
+    FRAME_CLEARANCE = 0.15
+    POLE_CLEARANCE = 0.24
 
     def __init__(self, obs: dict, time_scale: float = 1.5):
         """Optimize a nominal reference without changing any environment settings."""
@@ -149,14 +151,17 @@ class RaceTrajectory:
         pole_distance = np.linalg.norm(
             positions[:, None, :2] - self._obstacles[None, :, :2], axis=-1
         )
-        pole_penalty = np.maximum(0.20 - pole_distance, 0)
+        pole_penalty = np.maximum(self.POLE_CLEARANCE - pole_distance, 0)
         pole_penalty[positions[:, None, 2] > self._obstacles[None, :, 2] + 0.08] = 0
         force = np.linalg.norm(acceleration + [0, 0, 9.81], axis=1)
         floor_penalty = np.maximum(-positions[:, 2], 0)
         return float(
             times.sum()
             + 15000
-            * (np.square(np.maximum(0.11 - clearance, 0)).sum() + np.square(pole_penalty).sum())
+            * (
+                np.square(np.maximum(self.FRAME_CLEARANCE - clearance, 0)).sum()
+                + np.square(pole_penalty).sum()
+            )
             + 15000 * np.square(floor_penalty).sum()
             + 20 * np.mean(np.maximum(force - self.FORCE_LIMIT, 0) ** 2)
             + 20 * np.mean(np.maximum(2 - acceleration[:, 2] - 9.81, 0) ** 2)
@@ -176,7 +181,9 @@ class RaceTrajectory:
             + self._sequence.tobytes()
             + self._directions.tobytes()
         )
-        key += repr((self.FORCE_LIMIT, self.JERK_WEIGHT)).encode()
+        key += repr(
+            (self.FORCE_LIMIT, self.JERK_WEIGHT, self.FRAME_CLEARANCE, self.POLE_CLEARANCE)
+        ).encode()
         if key in _plan_cache:
             self._variables = _plan_cache[key].copy()
             return

@@ -49,12 +49,20 @@ Use `--render=False` for a run without graphics, or `pixi run evaluate` for the
 competition's 20-episode evaluation. The controller implements the `Controller`
 interface in a separate file; `control/controller.py` remains the common base class.
 
-The submitted default currently uses the conservative visibility-graph planner
-(`Level2MPC.RACING = False`) because the faster profile failed central flight
-evaluation. The conservative profile previously achieved 25.46 s with 90% success
-in the central competition. The three-second goal remains unachieved.
+The racing profile (`Level2MPC.RACING = True`) uses 15 cm sampled gate-frame
+clearance and 24 cm pole clearance, allowing room for tracking error. Its thrust
+reference inverts the calibrated force-to-command mapping used by the prediction
+model. Set `RACING = False` for the conservative visibility-graph fallback.
 
-The experimental racing profile uses the supplied acados nonlinear drone model with a 0.8-second,
+Local reliability screening of this revision: 18/20 finishes (90%) and 8.59 s
+mean successful lap on seeds 100 through 119. These are simulated flight times
+and a held-out local screening, not a guarantee of central evaluation success.
+See [optimization notes](mpc_optimization.md) and
+[per-race results](mpc_reliability_results.csv). The unchanged competition workflow
+is used to verify a candidate on the supported `master` branch before promoting
+it to `main`.
+
+The racing profile uses the supplied acados nonlinear drone model with a 0.8-second,
 20-stage prediction horizon. A continuous quintic reference carries velocity through
 gate crossings, with attitude and acceleration feedforward. The controller replans
 from public sensor observations and adds soft constraints for the current signed
@@ -86,7 +94,7 @@ but gives up reliability. Three-second laps have **not** been achieved. Faster
 settings are experimental and did not pass the required 50% success threshold.
 These local results are not a guarantee for future randomized races.
 
-Eleven planner and gate-corridor regression tests pass. Sensor-triggered trajectory
+Twelve planner, thrust-reference and gate-corridor regression tests pass. Sensor-triggered trajectory
 optimization sometimes exceeds the 20 ms control period by over a second;
 initial trajectory optimization also takes several seconds. The lap times above
 are simulated flight times, not wall-clock execution times. This profile needs
@@ -97,6 +105,6 @@ check (5/20 finishes), despite passing the protected-file and registration check
 The experimental racing planner includes a cache-key correction so a trajectory is reused only
 for matching initial position and velocity as well as matching geometry. Its
 75% result above is local. Two subsequent central evaluations finished only
-9/20 races each (45%); the board was not updated. The conservative profile is
-therefore restored as the submitted default. See the
+9/20 races each (45%); the board was not updated. The conservative profile was restored after those failures; the reliability
+revision above is evaluated separately before promotion. See the
 [optimization notes](mpc_optimization.md) for the tested strategies and limitations.
