@@ -168,7 +168,9 @@ class RaceTrajectory:
         """Optimize a feasible nominal trajectory before the control loop starts."""
         count = len(self._sequence)
         key = (
-            self._gates.tobytes()
+            self._start.tobytes()
+            + self._start_velocity.tobytes()
+            + self._gates.tobytes()
             + self._rotations.tobytes()
             + self._obstacles.tobytes()
             + self._sequence.tobytes()

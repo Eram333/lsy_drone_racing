@@ -70,17 +70,25 @@ Local Windows CPU validation with the unchanged 20-race evaluator:
 | Profile | Mean successful lap | Finished races |
 | --- | ---: | ---: |
 | Original conservative planner | 25.74 s | 19/20 (95%) |
-| Racing, `TIME_SCALE = 1.8` (default) | 8.30 s | 14/20 (70%) |
+| Racing, `TIME_SCALE = 1.8` (initial local result) | 8.30 s | 14/20 (70%) |
+| Racing, initial-state-aware cache (default) | 8.38 s | 15/20 (75%) |
 | Racing, `TIME_SCALE = 1.6` | approximately 7.4 s | 9/20 (45%, fails threshold) |
 | Racing, `TIME_SCALE = 1.4` | approximately 6.5 s | 6/20 (30%, fails threshold) |
 
-The default reduces the measured mean successful lap time by approximately 68%,
+The default reduces the measured mean successful lap time by approximately 67%,
 but gives up reliability. Three-second laps have **not** been achieved. Faster
 settings are experimental and did not pass the required 50% success threshold.
 These local results are not a guarantee for future randomized races.
 
-Ten planner and gate-corridor regression tests pass. Sensor-triggered trajectory
+Eleven planner and gate-corridor regression tests pass. Sensor-triggered trajectory
 optimization sometimes exceeds the 20 ms control period by over a second;
 initial trajectory optimization also takes several seconds. The lap times above
 are simulated flight times, not wall-clock execution times. This profile needs
 further work before use with a physical drone or strict real-time execution.
+
+The initial fast submission subsequently failed its central competition flight
+check (5/20 finishes), despite passing the protected-file and registration checks.
+The default now includes a cache-key correction so a trajectory is reused only
+for matching initial position and velocity as well as matching geometry. Its
+75% result above is local; a central pass must be verified separately. See the
+[optimization notes](mpc_optimization.md) for the tested strategies and limitations.

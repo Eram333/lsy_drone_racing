@@ -1,6 +1,8 @@
 """Continuity, geometry and signed-crossing checks for racing MPC references."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -14,6 +16,32 @@ from lsy_drone_racing.control.racing_trajectory import (
 
 class TestRacingTrajectory(unittest.TestCase):
     """Validate references independently of the simulator and trajectory optimizer."""
+
+    def test_plan_cache_includes_initial_state(self):
+        """Reuse plans only when both geometry and initial position and velocity match."""
+        planner = RaceTrajectory.__new__(RaceTrajectory)
+        planner._start = np.array([-1.5, 0.75, 0.01])
+        planner._start_velocity = np.zeros(3)
+        planner._gates = np.array([[0.5, 0.25, 0.7]])
+        planner._rotations = np.eye(3)[None]
+        planner._obstacles = np.empty((0, 3))
+        planner._sequence = np.array([0])
+        planner._directions = np.array([1])
+        planner._variables = np.r_[1.0, 1.0, np.zeros(5)]
+        result = SimpleNamespace(x=planner._variables.copy(), fun=0.0, success=True)
+        module = "lsy_drone_racing.control.racing_trajectory"
+        with patch.dict(f"{module}._plan_cache", clear=True), patch(
+            f"{module}.minimize", return_value=result
+        ) as optimize:
+            planner._optimize()
+            planner._optimize()
+            self.assertEqual(optimize.call_count, 1)
+            planner._start[0] += 0.1
+            planner._optimize()
+            self.assertEqual(optimize.call_count, 2)
+            planner._start_velocity[1] += 0.1
+            planner._optimize()
+            self.assertEqual(optimize.call_count, 3)
 
     def test_endpoint_derivatives(self):
         """Quintics must honor position, velocity and acceleration in physical time."""
