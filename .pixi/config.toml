@@ -1,0 +1,4 @@
+detached-environments = true
+
+[cache]
+root = 'C:\Users\narge\AppData\Local\lsy-team-pixi-cache'

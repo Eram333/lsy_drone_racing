@@ -102,7 +102,18 @@ class Level2MPC(Controller):
     """Replan gate approaches online and track them with an acados nonlinear MPC."""
 
     RACING = True
-    TIME_SCALE = 1.8
+    # The 1.45 profile is the fastest screened setting that passed fresh-seed
+    # validation; planner clearances and all environment rules remain unchanged.
+    TIME_SCALE = 1.45
+    # Modest passage-order retiming: leave the tight middle reversal unchanged.
+    # Shared gate derivatives keep both adjacent quintics smooth.
+    SECTION_TIME_FACTORS = (0.95, 1.0, 1.0, 0.95)
+    CROSSING_SPEED_FACTORS = (1.0, 1.0, 1.0, 1.05)
+    FINISH_TIME_FACTOR = 0.75
+    GATE_SLACK_CAPS = None
+    GATE_QUADRATIC_PENALTIES = None
+    GATE_LINEAR_PENALTIES = None
+    GATE_APPROACH_STEPS = 0
 
     def __init__(self, obs: dict, info: dict, config: dict):
         """Build the dynamics solver and initialize race progress."""
@@ -114,8 +125,31 @@ class Level2MPC(Controller):
         self._prediction_dt = 0.04
         self._params = load_params(Dynamics.so_rpy, config.sim.drone)
         self._solver, self._ocp = create_ocp_solver(
-            self._N * self._prediction_dt, self._N, self._params, racing=self.RACING
+            self._N * self._prediction_dt,
+            self._N,
+            self._params,
+            racing=self.RACING,
+            bounded_gate_slack=self.RACING and self.GATE_SLACK_CAPS is not None,
         )
+        if self.RACING:
+            for field, values in (
+                ("Zl", self.GATE_QUADRATIC_PENALTIES),
+                ("Zu", self.GATE_QUADRATIC_PENALTIES),
+                ("zl", self.GATE_LINEAR_PENALTIES),
+                ("zu", self.GATE_LINEAR_PENALTIES),
+            ):
+                if values is not None:
+                    values = np.asarray(values, dtype=float)
+                    if (
+                        values.shape != (4,)
+                        or not np.all(np.isfinite(values))
+                        or np.any(values < 0)
+                    ):
+                        raise ValueError("Expected four finite nonnegative gate penalties")
+                    if field.startswith("Z") and np.any(values <= 0):
+                        raise ValueError("Quadratic slack penalties must be positive")
+                    for stage in range(self._N):
+                        self._solver.cost_set(stage, field, values)
         self._hover = float(self._params["mass"] * -self._params["gravity_vec"][-1])
         if self.RACING:
             self._hover = float(collective_thrust_reference(np.zeros((1, 3)), self._params)[0])
@@ -136,7 +170,14 @@ class Level2MPC(Controller):
         if self.RACING:
             from lsy_drone_racing.control.racing_trajectory import RaceTrajectory
 
-            self._trajectory = RaceTrajectory(obs, time_scale=self.TIME_SCALE)
+        self._trajectory = RaceTrajectory(
+            obs,
+            time_scale=self.TIME_SCALE,
+            section_time_factors=self.SECTION_TIME_FACTORS,
+            crossing_speed_factors=self.CROSSING_SPEED_FACTORS,
+            finish_time_factor=self.FINISH_TIME_FACTOR,
+            dynamics=self._params,
+        )
 
     def _reference(self, obs: dict) -> tuple[NDArray, NDArray]:
         """Plan from available sensor observations without reading simulator state."""
@@ -300,10 +341,19 @@ class Level2MPC(Controller):
         )
 
     def _set_gate_corridor(self, obs: dict) -> None:
-        """Require the prediction to pass through the current observed gate opening."""
-        if self._gate_constraint_stage is not None:
-            self._solver.constraints_set(self._gate_constraint_stage, "lg", np.full(4, -1e4))
-            self._solver.constraints_set(self._gate_constraint_stage, "ug", np.full(4, 1e4))
+        """Encourage a crossing; optionally bound relaxation with hard outer rows.
+
+        These stage constraints do not certify continuous collision avoidance.
+        Only the unchanged environment awards valid signed gate passages.
+        """
+        rows = 8 if self.GATE_SLACK_CAPS is not None else 4
+        previous = getattr(self, "_gate_constraint_stages", None)
+        if previous is None:
+            previous = [] if self._gate_constraint_stage is None else [self._gate_constraint_stage]
+        for old_stage in previous:
+            self._solver.constraints_set(old_stage, "lg", np.full(rows, -1e4))
+            self._solver.constraints_set(old_stage, "ug", np.full(rows, 1e4))
+        self._gate_constraint_stages = []
         progress = int(obs["n_gates_passed"])
         if progress >= len(obs["gate_sequence"]):
             return
@@ -328,10 +378,39 @@ class Level2MPC(Controller):
         projected = matrix[:3, :3] @ centre
         lower = np.r_[projected + [0.06, -0.09, -0.09], 0.3]
         upper = np.r_[projected + [0.3, 0.09, 0.09], 5.0]
+        if self.GATE_SLACK_CAPS is not None:
+            caps = np.asarray(self.GATE_SLACK_CAPS, dtype=float)
+            if (
+                caps.shape != (4,)
+                or not np.all(np.isfinite(caps))
+                or np.any(caps < 0)
+                or np.any(caps > [0.6, 0.05, 0.05, 2.0])
+            ):
+                raise ValueError("Gate relaxation exceeds the permitted outer corridor")
+            matrix = np.vstack([matrix, matrix])
+            lower = np.r_[lower, lower - caps]
+            upper = np.r_[upper, upper + caps]
         self._solver.constraints_set(stage, "C", matrix, api="new")
         self._solver.constraints_set(stage, "lg", lower)
         self._solver.constraints_set(stage, "ug", upper)
         self._gate_constraint_stage = stage
+        self._gate_constraint_stages = [stage]
+        # A post-plane box alone does not constrain the approach to the near
+        # frame. Add an earlier alignment stage only with sufficient lead time.
+        lead = self.GATE_APPROACH_STEPS
+        if lead and stage >= 2 * lead:
+            approach_stage = stage - lead
+            approach_lower = lower.copy()
+            approach_upper = upper.copy()
+            approach_lower[0] = projected[0] - 0.4
+            approach_upper[0] = projected[0] - 0.04
+            if rows == 8:
+                approach_lower[4] = approach_lower[0] - caps[0]
+                approach_upper[4] = approach_upper[0] + caps[0]
+            self._solver.constraints_set(approach_stage, "C", matrix, api="new")
+            self._solver.constraints_set(approach_stage, "lg", approach_lower)
+            self._solver.constraints_set(approach_stage, "ug", approach_upper)
+            self._gate_constraint_stages.append(approach_stage)
 
     def step_callback(
         self,

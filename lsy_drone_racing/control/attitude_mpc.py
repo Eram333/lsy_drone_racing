@@ -56,13 +56,20 @@ def create_acados_model(parameters: dict) -> AcadosModel:
 
 
 def create_ocp_solver(
-    Tf: float, N: int, parameters: dict, verbose: bool = False, racing: bool = False
+    Tf: float,
+    N: int,
+    parameters: dict,
+    verbose: bool = False,
+    racing: bool = False,
+    bounded_gate_slack: bool = False,
 ) -> tuple[AcadosOcpSolver, AcadosOcp]:
     """Creates an acados Optimal Control Problem and Solver."""
     ocp = AcadosOcp()
     # Reuse generated libraries within a process: Windows cannot overwrite a DLL
     # while a previous episode's solver still holds it open.
     signature = repr((Tf, N, parameters, racing, RACING_VERSION if racing else 0)).encode()
+    if bounded_gate_slack:
+        signature += b"bounded_gate_corridor_v1"
     solver_key = hashlib.sha256(signature).hexdigest()[:16]
     ocp.code_export_directory = os.path.abspath(f"c_generated_code/mpc_{solver_key}")
 
@@ -162,15 +169,24 @@ def create_ocp_solver(
     if racing:
         # Allocate an online gate-crossing corridor. It is inactive except at
         # the selected crossing stage; slacks permit recovery from disturbances.
-        ocp.constraints.C = np.zeros((4, nx))
-        ocp.constraints.D = np.zeros((4, nu))
-        ocp.constraints.lg = np.full(4, -1e4)
-        ocp.constraints.ug = np.full(4, 1e4)
+        # The second set of rows is never softened. It bounds relaxation of
+        # the first set without mistaking acados' usg (a LOWER slack bound)
+        # for an upper slack bound. Positive penalties minimize actual slacks.
+        rows = 8 if bounded_gate_slack else 4
+        ocp.constraints.C = np.zeros((rows, nx))
+        ocp.constraints.D = np.zeros((rows, nu))
+        ocp.constraints.lg = np.full(rows, -1e4)
+        ocp.constraints.ug = np.full(rows, 1e4)
         ocp.constraints.idxsg = np.arange(4)
         ocp.cost.Zl = np.array([2e4, 2e4, 2e4, 2e3])
         ocp.cost.Zu = ocp.cost.Zl.copy()
         ocp.cost.zl = np.zeros(4)
         ocp.cost.zu = np.zeros(4)
+        # Match acados' previous fallback explicitly at the initial node.
+        ocp.cost.Zl_0 = ocp.cost.Zl.copy()
+        ocp.cost.Zu_0 = ocp.cost.Zu.copy()
+        ocp.cost.zl_0 = ocp.cost.zl.copy()
+        ocp.cost.zu_0 = ocp.cost.zu.copy()
 
     # Solver Options
     ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"  # FULL_, PARTIAL_ ,_HPIPM, _QPOASES

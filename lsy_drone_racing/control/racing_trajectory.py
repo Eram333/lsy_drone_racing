@@ -15,6 +15,31 @@ logger = logging.getLogger(__name__)
 _plan_cache: dict[bytes, NDArray] = {}
 
 
+def retime_sections(
+    variables: NDArray, time_factors: tuple[float, ...] = (), speed_factors: tuple[float, ...] = ()
+) -> NDArray:
+    """Adjust selected legs and crossing speeds while keeping shared boundary derivatives."""
+    result = np.asarray(variables, dtype=float).copy()
+    if result.ndim != 1 or not len(result) or len(result) % 7:
+        raise ValueError("Expected seven variables per gate passage")
+    count = len(result) // 7
+    if not np.all(np.isfinite(result)) or np.any(result[:count] <= 0):
+        raise ValueError("Trajectory variables must be finite with positive durations")
+    for factors in (time_factors, speed_factors):
+        values = np.asarray(factors, dtype=float)
+        if values.ndim != 1 or not np.all(np.isfinite(values)) or np.any(values <= 0):
+            raise ValueError("Timing and speed factors must be finite and positive")
+    # Factors address passage order, not physical gate IDs; repeated/reverse
+    # passages retain their own crossing conditions. Unspecified legs keep 1.0.
+    applied = min(count, len(time_factors))
+    result[:applied] *= time_factors[:applied]
+    applied = min(count, len(speed_factors))
+    result[count : count + applied] *= speed_factors[:applied]
+    tangents = result[5 * count :].reshape(count, 2)
+    tangents[:applied] *= np.asarray(speed_factors[:applied])[:, None]
+    return result
+
+
 def quintic_coefficients(
     points: NDArray, velocity: NDArray, acceleration: NDArray, durations: NDArray
 ) -> NDArray:
@@ -65,10 +90,26 @@ class RaceTrajectory:
     JERK_WEIGHT = 0.00003
     FRAME_CLEARANCE = 0.15
     POLE_CLEARANCE = 0.24
+    ANALYTIC_INITIALIZATION = True
 
-    def __init__(self, obs: dict, time_scale: float = 1.5):
+    def __init__(
+        self,
+        obs: dict,
+        time_scale: float = 1.5,
+        section_time_factors: tuple[float, ...] = (),
+        crossing_speed_factors: tuple[float, ...] = (),
+        finish_time_factor: float = 1.0,
+        dynamics: dict | None = None,
+    ):
         """Optimize a nominal reference without changing any environment settings."""
+        from lsy_drone_racing.control.trajectory_gradient import TrajectoryCost
+
         self._time = 0.0
+        if not np.isfinite(finish_time_factor) or not 0.5 <= finish_time_factor <= 1:
+            raise ValueError("Finish time factor must be between 0.5 and 1")
+        self._finish_time_factor = finish_time_factor
+        self._dynamics = dynamics
+        self._finish_factor_used = 1.0
         self._start = np.asarray(obs["pos"], dtype=float).copy()
         self._start_velocity = np.asarray(obs["vel"], dtype=float).copy()
         self._sequence = np.asarray(obs["gate_sequence"], dtype=int)
@@ -82,8 +123,13 @@ class RaceTrajectory:
         self._variables[count : 2 * count] /= time_scale
         self._variables[2 * count : 5 * count] /= time_scale**2
         self._variables[5 * count :] /= time_scale
+        self._variables = retime_sections(
+            self._variables, section_time_factors, crossing_speed_factors
+        )
         self._coefficients = self._coefficients_for(self._variables)
         self._last_progress = 0
+        # Construct/cache the derivative graph before entering the control loop.
+        self._gradient_cost = TrajectoryCost(self)
         logger.info("Continuous MPC reference: %.2f seconds", self._variables[:count].sum())
 
     def _key(self) -> bytes:
@@ -98,7 +144,7 @@ class RaceTrajectory:
         if self._key() != self._geometry_key:
             self._geometry_key = self._key()
             self._repair_plan(old_position, old_velocity)
-        self._coefficients = self._coefficients_for(self._variables)
+            self._coefficients = self._coefficients_for(self._variables)
         progress = int(obs["n_gates_passed"])
         boundaries = np.r_[0, np.cumsum(self._variables[: len(self._sequence)])]
         if progress < len(self._sequence):
@@ -106,10 +152,90 @@ class RaceTrajectory:
         if progress > self._last_progress:
             self._time = max(self._time, boundaries[progress])
             self._last_progress = progress
+            # Change no reference before the penultimate gate has been passed.
+            # Only splice at the existing C2 join; a late passage keeps its plan.
+            if (
+                progress == len(self._sequence) - 1
+                and abs(self._time - boundaries[progress]) < 1e-9
+                and getattr(self, "_finish_time_factor", 1.0) < 1
+            ):
+                self._retime_finish()
         times = self._time + offsets
         positions, velocities = self._reference(times), self._reference(times, 1)
         accelerations = self._reference(times, 2)
         return positions, velocities, accelerations
+
+    def _retime_finish(self) -> None:
+        """Shorten only the final leg when sampled geometry and model demands allow it."""
+        if self._dynamics is None:
+            return
+        count = len(self._sequence)
+        original = self._variables.copy()
+        for factor in np.arange(self._finish_time_factor, 1.0 - 1e-9, 0.05):
+            candidate = original.copy()
+            candidate[count - 1] *= factor
+            candidate[2 * count - 1] /= factor
+            candidate[-2:] /= factor
+            coefficients = self._coefficients_for(candidate)
+            if self._finish_feasible(coefficients[-1:], candidate[count - 1 : count]):
+                self._variables = candidate
+                self._coefficients = coefficients
+                self._finish_factor_used = float(factor)
+                logger.info(
+                    "Final leg retimed to %.0f%% after confirmed gate passage", 100 * factor
+                )
+                return
+
+    def _finish_feasible(self, coefficients: NDArray, duration: NDArray) -> bool:
+        """Screen sampled clearance and feedforward demands; not a flight certificate."""
+        samples = np.linspace(0, 1, 81)
+        positions = sample_segments(coefficients, duration, samples)[0]
+        velocity = sample_segments(coefficients, duration, samples, 1)[0]
+        acceleration = sample_segments(coefficients, duration, samples, 2)[0]
+        if not all(np.all(np.isfinite(values)) for values in (positions, velocity, acceleration)):
+            return False
+        if (
+            np.any(positions[:, 2] < 0)
+            or np.any(
+                frame_clearance(positions, self._gates, self._rotations) < self.FRAME_CLEARANCE
+            )
+            or np.any(np.linalg.norm(velocity, axis=1) > 4)
+        ):
+            return False
+        distance = np.linalg.norm(positions[:, None, :2] - self._obstacles[None, :, :2], axis=-1)
+        below_pole = positions[:, None, 2] <= self._obstacles[None, :, 2] + 0.08
+        if np.any((distance < self.POLE_CLEARANCE) & below_pole):
+            return False
+        parameters = self._dynamics
+        forces = acceleration - parameters["gravity_vec"]
+        magnitude = np.linalg.norm(forces, axis=1)
+        if np.any(magnitude > self.FORCE_LIMIT) or np.any(forces[:, 2] < 2):
+            return False
+        thrust = (parameters["mass"] * magnitude - parameters["acc_coef"]) / parameters[
+            "cmd_f_coef"
+        ]
+        if np.any(thrust < 4 * parameters["thrust_min"]) or np.any(
+            thrust > 0.95 * 4 * parameters["thrust_max"]
+        ):
+            return False
+        z_axis = forces / magnitude[:, None]
+        y_axis = np.cross(z_axis, np.array([1, 0, 0]))
+        y_axis /= np.maximum(np.linalg.norm(y_axis, axis=1, keepdims=True), 1e-9)
+        x_axis = np.cross(y_axis, z_axis)
+        rpy = np.unwrap(
+            Rotation.from_matrix(np.stack([x_axis, y_axis, z_axis], axis=-1)).as_euler("xyz"),
+            axis=0,
+        )
+        dt = float(duration[0]) / (len(samples) - 1)
+        rates = np.gradient(rpy, dt, axis=0, edge_order=2)
+        angular_acceleration = np.gradient(rates, dt, axis=0, edge_order=2)
+        commands = (
+            angular_acceleration
+            - parameters["rpy_coef"] * rpy
+            - parameters["rpy_rates_coef"] * rates
+        ) / parameters["cmd_rpy_coef"]
+        # Reserve nominal headroom within the unchanged racing input limits.
+        return bool(np.all(np.isfinite(commands)) and np.all(np.abs(commands) <= [0.9, 0.9, 0.45]))
 
     def _geometry(self, obs: dict) -> None:
         """Refresh geometry only from the sensor-facing observation dictionary."""
@@ -124,7 +250,12 @@ class RaceTrajectory:
         """Build a trajectory from segment times, crossing speeds and gate accelerations."""
         count = len(self._sequence)
         velocities = np.vstack([self._start_velocity, self._gate_velocities(variables)])
-        accelerations = np.vstack([np.zeros(3), variables[2 * count : 5 * count].reshape(count, 3)])
+        accelerations = np.vstack(
+            [
+                getattr(self, "_start_acceleration", np.zeros(3)),
+                variables[2 * count : 5 * count].reshape(count, 3),
+            ]
+        )
         return quintic_coefficients(self._points, velocities, accelerations, variables[:count])
 
     def _gate_velocities(self, variables: NDArray) -> NDArray:
@@ -184,6 +315,8 @@ class RaceTrajectory:
         key += repr(
             (self.FORCE_LIMIT, self.JERK_WEIGHT, self.FRAME_CLEARANCE, self.POLE_CLEARANCE)
         ).encode()
+        if self.ANALYTIC_INITIALIZATION:
+            key += b"analytic_initialization"
         if key in _plan_cache:
             self._variables = _plan_cache[key].copy()
             return
@@ -193,16 +326,27 @@ class RaceTrajectory:
             + [(-12, 12)] * (3 * count)
             + [(-2.5, 2.5), (0, 0)] * count
         )
+        objective = self._objective
+        if self.ANALYTIC_INITIALIZATION:
+            from lsy_drone_racing.control.trajectory_gradient import TrajectoryCost
+
+            objective = TrajectoryCost(self).bind(self)
         result = minimize(
-            self._objective,
+            objective,
             self._variables,
             method="L-BFGS-B",
+            jac=True if self.ANALYTIC_INITIALIZATION else None,
             bounds=bounds,
             options={"maxiter": 160, "ftol": 1e-8, "maxls": 30},
         )
         self._variables = result.x
         _plan_cache[key] = result.x.copy()
-        logger.info("Trajectory optimization cost %.3f; converged=%s", result.fun, result.success)
+        logger.info(
+            "Trajectory optimization cost %.3f; converged=%s (%s)",
+            result.fun,
+            result.success,
+            getattr(result, "message", ""),
+        )
 
     def _reference(self, times: NDArray, derivative: int = 0) -> NDArray:
         """Evaluate the sensor-updated trajectory at absolute race times."""
@@ -241,21 +385,15 @@ class RaceTrajectory:
         basis = tau ** np.arange(6)
         dbasis = np.r_[0, np.arange(1, 6) * tau ** np.arange(5)] / durations[segment]
 
-        def objective(variables: NDArray) -> float:
-            coefficient = self._coefficients_for(variables)[segment]
-            position = basis @ coefficient
-            velocity = dbasis @ coefficient
-            return (
-                self._objective(variables)
-                + 200 * np.sum((position - old_position) ** 2)
-                + 2 * np.sum((velocity - old_velocity) ** 2)
-                + 0.05 * np.sum((variables[2 * count :] - original[2 * count :]) ** 2)
-            )
+        anchor = np.r_[np.eye(count)[segment], basis, dbasis, old_position, old_velocity]
+        objective = self._gradient_cost.bind(self, anchor, original)
+        initial_cost = objective(original)[0]
 
         result = minimize(
             objective,
             original,
             method="L-BFGS-B",
+            jac=True,
             bounds=[(v, v) for v in original[: 2 * count]]
             + [(max(-12, v - 6), min(12, v + 6)) for v in original[2 * count : 5 * count]]
             + [
@@ -265,5 +403,9 @@ class RaceTrajectory:
             ],
             options={"maxiter": 30, "maxls": 20, "ftol": 1e-6},
         )
-        if np.all(np.isfinite(result.x)):
+        if (
+            np.all(np.isfinite(result.x))
+            and np.isfinite(result.fun)
+            and result.fun <= initial_cost + 1e-9
+        ):
             self._variables = result.x
