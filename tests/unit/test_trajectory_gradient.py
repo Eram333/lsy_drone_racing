@@ -6,10 +6,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
+from lsy_drone_racing.control.trajectory_gradient import TrajectoryCost
 from scipy.spatial.transform import Rotation
 
 from lsy_drone_racing.control.racing_trajectory import RaceTrajectory
-from lsy_drone_racing.control.trajectory_gradient import TrajectoryCost
 
 
 class TestTrajectoryGradient(unittest.TestCase):
