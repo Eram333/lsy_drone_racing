@@ -1,458 +1,363 @@
-"""Observation-based gate planning with nonlinear attitude MPC for level 2.
+"""Four-dimensional attitude MPC with observed-map collision-aware routing.
 
-The racing planner builds a continuous quintic trajectory through signed gate
-crossings, updates it from public sensor observations, and supplies position,
-velocity and attitude references to the acados MPC. Soft prediction constraints
-encourage crossing the current gate opening. Sampled obstacle clearance remains
-a planning heuristic; randomized races can still fail. The conservative
-visibility-graph planner is available with RACING=False.
+The finite-horizon QP predicts position, velocity and acceleration with a first-order
+attitude response. Only its first acceleration command is applied as roll, pitch,
+yaw and collective thrust (N). No simulator state is inspected by this controller.
 """
 
 from __future__ import annotations
 
 import heapq
-import json
-import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
-from crazyflow.dynamics import Dynamics, load_params
-from crazyflow.dynamics.utils.rotation import ang_vel2rpy_rates
-from scipy.spatial.transform import Rotation
+from crazyflow.dynamics import load_params
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.attitude_mpc import create_ocp_solver
 
 if TYPE_CHECKING:
-    from numpy.typing import NDArray
-
-logger = logging.getLogger(__name__)
-
-
-def collective_thrust_reference(accelerations: NDArray, parameters: dict) -> NDArray:
-    """Invert the prediction model's calibrated force-to-command mapping."""
-    forces = parameters["mass"] * np.linalg.norm(accelerations - parameters["gravity_vec"], axis=-1)
-    return (forces - parameters["acc_coef"]) / parameters["cmd_f_coef"]
-
-
-def segment_clear(a: NDArray, b: NDArray, centres: NDArray, radii: NDArray) -> bool:
-    """Check a horizontal line segment against inflated circular obstacles."""
-    delta = b - a
-    t = np.clip((centres - a) @ delta / max(float(delta @ delta), 1e-12), 0, 1)
-    distance = np.linalg.norm(centres - a - t[:, None] * delta, axis=1)
-    return bool(np.all(distance >= radii - 1e-8))
-
-
-def transit_path(start: NDArray, goal: NDArray, centres: NDArray, radii: NDArray) -> NDArray:
-    """Find a short collision-free polyline through a circular visibility graph."""
-    if segment_clear(start[:2], goal[:2], centres, radii):
-        return np.array([start, goal])
-    angles = np.arange(16) * (2 * np.pi / 16)
-    ring = np.stack([np.cos(angles), np.sin(angles)], axis=1)
-    candidates = (centres[:, None] + (radii[:, None, None] + 0.04) * ring).reshape(-1, 2)
-    valid = np.all(np.linalg.norm(candidates[:, None] - centres, axis=2) >= radii[None], axis=1)
-    valid &= (np.abs(candidates[:, 0]) < 2.35) & (np.abs(candidates[:, 1]) < 1.35)
-    nodes = np.vstack([start[:2], goal[:2], candidates[valid]])
-    distances = np.full(len(nodes), np.inf)
-    distances[0] = 0
-    previous = np.full(len(nodes), -1, dtype=int)
-    queue = [(0.0, 0)]
-    while queue:
-        cost, index = heapq.heappop(queue)
-        if index == 1:
-            break
-        if cost > distances[index]:
-            continue
-        delta = nodes - nodes[index]
-        length = np.linalg.norm(delta, axis=1)
-        offsets = centres - nodes[index]
-        fraction = np.clip(offsets @ delta.T / np.maximum(length**2, 1e-12), 0, 1)
-        separation = offsets[:, None] - fraction[:, :, None] * delta[None]
-        clear = np.all(np.linalg.norm(separation, axis=2) >= radii[:, None] - 1e-8, axis=0)
-        for other in np.flatnonzero(clear & (cost + length < distances)):
-            distances[other] = cost + length[other]
-            previous[other] = index
-            heapq.heappush(queue, (distances[other], int(other)))
-    if not np.isfinite(distances[1]):
-        # Hold rather than deliberately fly through an obstacle.
-        return np.array([start, start])
-    indices = [1]
-    while indices[-1] != 0:
-        indices.append(previous[indices[-1]])
-    xy = nodes[indices[::-1]]
-    lengths = np.r_[0, np.cumsum(np.linalg.norm(np.diff(xy, axis=0), axis=1))]
-    z = start[2] + (goal[2] - start[2]) * lengths / max(lengths[-1], 1e-9)
-    return np.column_stack([xy, z])
-
-
-def sample_path(path: NDArray, times: NDArray, speed: float) -> tuple[NDArray, NDArray]:
-    """Sample a polyline at bounded speed, braking near its endpoint."""
-    lengths = np.linalg.norm(np.diff(path, axis=0), axis=1)
-    arc = np.r_[0, np.cumsum(lengths)]
-    speed = min(speed, np.sqrt(max(0.0, 1.8 * arc[-1])))
-    distance = np.minimum(times * speed, arc[-1])
-    pos = np.column_stack([np.interp(distance, arc, path[:, axis]) for axis in range(3)])
-    indices = np.minimum(np.searchsorted(arc[1:], distance, side="right"), len(lengths) - 1)
-    vel = np.diff(path, axis=0)[indices] / np.maximum(lengths[indices, None], 1e-9) * speed
-    vel[distance >= arc[-1] - 1e-6] = 0
-    return pos, vel
+    from crazyflow import Sim
+    from ml_collections import ConfigDict
+from scipy.linalg import expm
+from scipy.spatial.transform import Rotation
 
 
 class Level2MPC(Controller):
-    """Replan gate approaches online and track them with an acados nonlinear MPC."""
+    """Replan on observed map updates and track with constrained linear MPC."""
 
-    RACING = True
-    # The 1.45 profile is the fastest screened setting that passed fresh-seed
-    # validation; planner clearances and all environment rules remain unchanged.
-    TIME_SCALE = 1.45
-    # Modest passage-order retiming: leave the tight middle reversal unchanged.
-    # Shared gate derivatives keep both adjacent quintics smooth.
-    SECTION_TIME_FACTORS = (0.95, 1.0, 1.0, 0.95)
-    CROSSING_SPEED_FACTORS = (1.0, 1.0, 1.0, 1.05)
-    FINISH_TIME_FACTOR = 0.75
-    GATE_SLACK_CAPS = None
-    GATE_QUADRATIC_PENALTIES = None
-    GATE_LINEAR_PENALTIES = None
-    GATE_APPROACH_STEPS = 0
-
-    def __init__(self, obs: dict, info: dict, config: dict):
-        """Build the dynamics solver and initialize race progress."""
+    def __init__(self, obs: dict, info: dict, config: ConfigDict):
+        """Build a 1.2-second, 20-stage prediction model and initialize navigation."""
         super().__init__(obs, info, config)
         if config.env.control_mode != "attitude":
-            raise ValueError("level2_mpc.py requires env.control_mode = 'attitude'")
-        self._dt = 1 / config.env.freq
-        self._N = 20 if self.RACING else 25
-        self._prediction_dt = 0.04
-        self._params = load_params(Dynamics.so_rpy, config.sim.drone)
-        self._solver, self._ocp = create_ocp_solver(
-            self._N * self._prediction_dt,
-            self._N,
-            self._params,
-            racing=self.RACING,
-            bounded_gate_slack=self.RACING and self.GATE_SLACK_CAPS is not None,
+            raise ValueError("Level2MPC requires the 4D attitude interface.")
+        self.dt = 1.0 / config.env.freq
+        params = load_params(config.sim.dynamics, config.sim.drone)
+        self.mass0 = float(params["mass"])
+        self.mass = self.mass0
+        self.thrust_bounds = np.array([params["thrust_min"], params["thrust_max"]]) * 4
+        self.phase = "takeoff"
+        self.passed = 0
+        self.target = np.asarray(obs["pos"], float).copy()
+        self.target[2] = 0.65
+        self.route = []
+        self.route_goal = None
+        self.next_plan_tick = 0
+        self.map_key = None
+        self.n = 20
+        self.h = 0.06
+        # Exact ZOH discretization of p'=v, v'=a, a'=(u-a)/tau.
+        continuous = np.array(
+            [[0, 1, 0, 0], [0, 0, 1, 0], [0, 0, -1 / 0.10, 1 / 0.10], [0, 0, 0, 0.0]]
         )
-        if self.RACING:
-            for field, values in (
-                ("Zl", self.GATE_QUADRATIC_PENALTIES),
-                ("Zu", self.GATE_QUADRATIC_PENALTIES),
-                ("zl", self.GATE_LINEAR_PENALTIES),
-                ("zu", self.GATE_LINEAR_PENALTIES),
-            ):
-                if values is not None:
-                    values = np.asarray(values, dtype=float)
-                    if (
-                        values.shape != (4,)
-                        or not np.all(np.isfinite(values))
-                        or np.any(values < 0)
-                    ):
-                        raise ValueError("Expected four finite nonnegative gate penalties")
-                    if field.startswith("Z") and np.any(values <= 0):
-                        raise ValueError("Quadratic slack penalties must be positive")
-                    for stage in range(self._N):
-                        self._solver.cost_set(stage, field, values)
-        self._hover = float(self._params["mass"] * -self._params["gravity_vec"][-1])
-        if self.RACING:
-            self._hover = float(collective_thrust_reference(np.zeros((1, 3)), self._params)[0])
-        self._nx = self._ocp.model.x.rows()
-        self._thrust_bias = 0.0
-        self._gate = -1
-        self._crossing = False
-        self._tick = 0
-        self._failures = 0
-        self._path = None
-        self._geometry = None
-        self._exit = None
-        self._previous_gate_geometry = None
-        self._gate_constraint_stage = None
-        self._trajectory = None
-        self._last_observation = None
-        self._last_reference_position = None
-        if self.RACING:
-            from lsy_drone_racing.control.racing_trajectory import RaceTrajectory
+        discrete = expm(continuous * self.h)
+        A, B = discrete[:3, :3], discrete[:3, 3:]
+        F = np.vstack([np.linalg.matrix_power(A, k + 1) for k in range(self.n)])
+        G = np.zeros((3 * self.n, self.n))
+        for k in range(self.n):
+            for j in range(k + 1):
+                G[3 * k : 3 * k + 3, j] = (np.linalg.matrix_power(A, k - j) @ B).ravel()
+        weights = np.tile([60.0, 8.0, 0.08], self.n)
+        weights[-3:] *= 3
+        D = np.eye(self.n) - np.eye(self.n, k=-1)
+        self.F, self.G = F, G
+        self.GQ = G.T * weights
+        self.H = self.GQ @ G + 0.35 * np.eye(self.n) + 0.4 * D.T @ D
+        self.invH = np.linalg.inv(self.H)
+        self.L = np.linalg.eigvalsh(self.H)[-1]
+        self.u = np.zeros((self.n, 3))
+        self.last_vel = np.asarray(obs["vel"], float).copy()
+        self.last_action = np.array([0.0, 0.0, 0.0, self.mass * 9.81])
+        self.accel = np.zeros(3)
+        self.tick = 0
+        self.failures = 0
+        self.lower = np.asarray(config.env.track.safety_limits.pos_limit_low, float) + 0.14
+        self.upper = np.asarray(config.env.track.safety_limits.pos_limit_high, float) - 0.14
+        self.lower[2] = 0.15
 
-        self._trajectory = RaceTrajectory(
-            obs,
-            time_scale=self.TIME_SCALE,
-            section_time_factors=self.SECTION_TIME_FACTORS,
-            crossing_speed_factors=self.CROSSING_SPEED_FACTORS,
-            finish_time_factor=self.FINISH_TIME_FACTOR,
-            dynamics=self._params,
+    def geometry(self, obs: dict, index: int) -> tuple[np.ndarray, np.ndarray]:
+        """Read the active signed gate entry, including repeated physical gates."""
+        gid = int(obs["gate_sequence"][index])
+        rot = Rotation.from_quat(obs["gates_quat"][gid]).as_matrix()
+        return np.asarray(obs["gates_pos"][gid], float), rot[:, 0] * int(
+            obs["gate_sequence_direction"][index]
         )
 
-    def _reference(self, obs: dict) -> tuple[NDArray, NDArray]:
-        """Plan from available sensor observations without reading simulator state."""
-        if getattr(self, "_trajectory", None) is not None:
-            times = np.arange(self._N + 1) * self._prediction_dt
-            positions, velocities, self._reference_acceleration = self._trajectory.sample(
-                obs, times
-            )
-            return positions, velocities
-        pos = np.asarray(obs["pos"], dtype=float)
-        progress = int(obs["n_gates_passed"])
-        if progress >= len(obs["gate_sequence"]):
-            return np.tile(pos, (self._N + 1, 1)), np.zeros((self._N + 1, 3))
-        if progress != self._gate:
-            if self._previous_gate_geometry is not None:
-                self._exit = self._previous_gate_geometry
-            self._gate = progress
-            self._crossing = False
-            self._path = None
-            logger.info("Planning gate %d/%d", progress + 1, len(obs["gate_sequence"]))
-        if self._exit is not None:
-            exit_centre, exit_normal = self._exit
-            if (pos - exit_centre) @ exit_normal < 0.25 or np.asarray(
-                obs["vel"]
-            ) @ exit_normal > 0.3:
-                # Clear the previous frame before turning or changing altitude.
-                path = np.array([pos, exit_centre + 0.3 * exit_normal])
-                times = np.arange(self._N + 1) * self._prediction_dt
-                return sample_path(path, times, 0.3)
-            self._exit = None
-        gate_id = int(obs["gate_sequence"][progress])
-        centre = np.asarray(obs["gates_pos"][gate_id], dtype=float)
-        rotation = Rotation.from_quat(obs["gates_quat"][gate_id])
-        direction = int(obs["gate_sequence_direction"][progress])
-        normal = rotation.apply([direction, 0, 0])
-        self._previous_gate_geometry = (centre.copy(), normal.copy())
-        approach = centre - 0.45 * normal
-        centres = list(np.asarray(obs["obstacles_pos"])[:, :2])
-        radii = [0.24] * len(centres)
-        # Approximate complete frames as inflated horizontal segments. The target
-        # gate keeps its opening so a nearby obstacle cannot force a long approach
-        # that would run through that obstacle on the way to the gate centre.
-        for index, (gate_pos, gate_quat) in enumerate(zip(obs["gates_pos"], obs["gates_quat"])):
-            offsets = (-0.28, 0.28) if index == gate_id else (-0.32, -0.16, 0, 0.16, 0.32)
-            for sideways in offsets:
-                point = gate_pos + Rotation.from_quat(gate_quat).apply([0, sideways, 0])
-                centres.append(point[:2])
-                radii.append(0.15 if index == gate_id else 0.2)
-        centres, radii = np.asarray(centres), np.asarray(radii)
-        for offset in (0.45, 0.35, 0.3, 0.25, 0.18, 0.12, 0.08, 0.6, 0.75):
-            candidate = centre - offset * normal
-            crossing_clear = segment_clear(candidate[:2], centre[:2], centres, radii)
-            if crossing_clear and np.all(
-                np.linalg.norm(centres - candidate[:2], axis=1) > radii + 0.01
-            ):
-                approach = candidate
-                break
-        local = rotation.apply(pos - centre, inverse=True)
-        if direction * local[0] < -0.04 and np.linalg.norm(pos - approach) < 0.12:
-            self._crossing = True
-        # A missed crossing must return to the approach side before retrying.
-        if self._crossing and direction * local[0] > 0.4:
-            self._crossing = False
-        target = centre + 0.4 * normal if self._crossing else approach
-        if self._tick * self._dt < 1.5:
-            target = np.array([pos[0], pos[1], 0.45])
-            path = np.array([pos, target])
-        elif self._crossing:
-            path = (
-                np.array([pos, centre, target])
-                if direction * local[0] < 0
-                else np.array([pos, target])
-            )
-        else:
-            # Allow recovery when a newly revealed object overlaps the current clearance disc.
-            radii = np.minimum(
-                radii, np.maximum(0.03, np.linalg.norm(centres - pos[:2], axis=1) - 0.01)
-            )
-            geometry = np.r_[centres.ravel(), target]
-            if self._path is None or not np.array_equal(geometry, self._geometry):
-                self._path = transit_path(pos, target, centres, radii)
-                self._geometry = geometry.copy()
-            if len(self._path) > 2:
-                segments = np.diff(self._path[:, :2], axis=0)
-                fractions = np.clip(
-                    np.sum((pos[:2] - self._path[:-1, :2]) * segments, axis=1)
-                    / np.maximum(np.sum(segments**2, axis=1), 1e-9),
-                    0,
-                    1,
-                )
-                closest = self._path[:-1, :2] + fractions[:, None] * segments
-                nearest = int(np.argmin(np.linalg.norm(closest - pos[:2], axis=1)))
-                self._path = self._path[nearest:]
-            while len(self._path) > 2 and np.linalg.norm(pos[:2] - self._path[1, :2]) < 0.07:
-                self._path = self._path[1:]
-            # Track only the next clear segment, preventing shortcuts at corners.
-            path = np.array([pos, self._path[1]])
-        times = np.arange(self._N + 1) * self._prediction_dt
-        return sample_path(path, times, 0.55 if self._crossing else 0.9)
-
-    def compute_control(self, obs: dict, info: dict | None = None) -> NDArray:
-        """Solve the finite-horizon tracking problem and apply its first input."""
-        self._last_observation = obs
-        rpy = Rotation.from_quat(obs["quat"]).as_euler("xyz")
-        rates = np.asarray(ang_vel2rpy_rates(obs["quat"], obs["ang_vel"]), dtype=float)
-        state = np.concatenate([obs["pos"], rpy, obs["vel"], rates]).astype(float)
-        self._solver.set(0, "lbx", state)
-        self._solver.set(0, "ubx", state)
-        positions, velocities = self._reference(obs)
-        self._last_reference_position = positions[0].copy()
-        if self.RACING:
-            self._set_gate_corridor(obs)
-        reference_rpy = np.zeros((self._N + 1, 3))
-        reference_rates = np.zeros_like(reference_rpy)
-        reference_thrust = np.full(self._N + 1, self._hover)
-        if self.RACING:
-            forces = self._reference_acceleration - self._params["gravity_vec"]
-            reference_thrust = collective_thrust_reference(
-                self._reference_acceleration, self._params
-            )
-            z_axis = forces / np.maximum(np.linalg.norm(forces, axis=1, keepdims=True), 1e-9)
-            y_axis = np.cross(z_axis, np.array([1, 0, 0]))
-            y_axis /= np.maximum(np.linalg.norm(y_axis, axis=1, keepdims=True), 1e-9)
-            x_axis = np.cross(y_axis, z_axis)
-            reference_rpy = Rotation.from_matrix(
-                np.stack([x_axis, y_axis, z_axis], axis=-1)
-            ).as_euler("xyz")
-            reference_rates = np.gradient(reference_rpy, self._prediction_dt, axis=0)
-        # Slow integral trim compensates for randomized mass and steady vertical disturbance.
-        self._thrust_bias = float(
-            np.clip(
-                self._thrust_bias + 0.025 * (positions[-1, 2] - state[2]) * self._dt, -0.065, 0.065
-            )
+    def update_map(self, obs: dict) -> bool:
+        """Use only public observations; inflate objects not yet observed accurately."""
+        self.centers = np.asarray(obs["gates_pos"], float)
+        self.rot = Rotation.from_quat(obs["gates_quat"]).as_matrix()
+        self.poles = np.asarray(obs["obstacles_pos"], float)
+        # A 17 cm clearance includes the vehicle footprint and tracking reserve.
+        # Keeping the nominal-position uncertainty after observing a pole can
+        # incorrectly close a physically traversable gate approach.
+        self.pole_r = np.where(obs["obstacles_visited"], 0.17, 0.35)
+        self.margin = np.where(obs["gates_visited"], 0.105, 0.24)
+        key = (
+            self.centers.tobytes(),
+            self.rot.tobytes(),
+            self.poles.tobytes(),
+            np.asarray(obs["gates_visited"]).tobytes(),
+            np.asarray(obs["obstacles_visited"]).tobytes(),
         )
-        for stage in range(self._N):
-            reference = np.zeros(self._nx + 4)
-            reference[:3] = positions[stage]
-            reference[3:6] = reference_rpy[stage]
-            reference[6:9] = velocities[stage]
-            reference[9:12] = reference_rates[stage]
-            reference[self._nx : self._nx + 3] = reference_rpy[stage]
-            reference[self._nx + 3] = reference_thrust[stage] + self._thrust_bias
-            self._solver.set(stage, "yref", reference)
-        terminal = np.zeros(self._nx)
-        terminal[:3] = positions[-1]
-        terminal[3:6] = reference_rpy[-1]
-        terminal[6:9] = velocities[-1]
-        terminal[9:12] = reference_rates[-1]
-        self._solver.set(self._N, "yref", terminal)
-        status = self._solver.solve()
-        action = self._solver.get(0, "u")
-        if status not in (0, 2) or not np.all(np.isfinite(action)):
-            self._failures += 1
-            if self._failures == 1:
-                logger.warning("MPC solve failed (status %s); applying hover fallback", status)
-            action = np.array([0, 0, 0, self._hover + self._thrust_bias])
-        else:
-            self._failures = 0
-        return np.clip(action, self._ocp.constraints.lbu, self._ocp.constraints.ubu).astype(
-            np.float32
-        )
+        changed = key != self.map_key
+        self.map_key = key
+        return changed
 
-    def _set_gate_corridor(self, obs: dict) -> None:
-        """Encourage a crossing; optionally bound relaxation with hard outer rows.
+    def clear_segments(self, a: np.ndarray, ends: np.ndarray, escape: bool = False) -> np.ndarray:
+        """Check segments against inflated poles and the gate.xml collision boxes.
 
-        These stage constraints do not certify continuous collision avoidance.
-        Only the unchanged environment awards valid signed gate passages.
+        Escape edges may leave a pole's planning margin, but cannot approach it
+        closer than the starting distance (minus 5 mm), or within 12 cm. Their
+        endpoints must clear the full margin. This is not a collision guarantee
+        for arbitrary tracking errors or a different drone geometry.
         """
-        rows = 8 if self.GATE_SLACK_CAPS is not None else 4
-        previous = getattr(self, "_gate_constraint_stages", None)
-        if previous is None:
-            previous = [] if self._gate_constraint_stage is None else [self._gate_constraint_stage]
-        for old_stage in previous:
-            self._solver.constraints_set(old_stage, "lg", np.full(rows, -1e4))
-            self._solver.constraints_set(old_stage, "ug", np.full(rows, 1e4))
-        self._gate_constraint_stages = []
-        progress = int(obs["n_gates_passed"])
-        if progress >= len(obs["gate_sequence"]):
-            return
-        index = int(obs["gate_sequence"][progress])
-        centre = np.asarray(obs["gates_pos"][index], dtype=float)
-        rotation = Rotation.from_quat(obs["gates_quat"][index]).as_matrix()
-        normal = rotation[:, 0] * int(obs["gate_sequence_direction"][progress])
-        distance = max(0.0, -(np.asarray(obs["pos"]) - centre) @ normal)
-        remaining = float(
-            np.sum(self._trajectory._variables[: progress + 1]) - self._trajectory._time
-        )
-        deadline = max(remaining, 0.2, np.sqrt(2 * distance / 8))
-        if deadline > (self._N - 1) * self._prediction_dt:
-            self._gate_constraint_stage = None
-            return
-        stage = int(np.clip(np.ceil(deadline / self._prediction_dt), 1, self._N - 1))
-        matrix = np.zeros((4, getattr(self, "_nx", 12)))
-        matrix[0, :3] = normal
-        matrix[1, :3] = rotation[:, 1]
-        matrix[2, :3] = rotation[:, 2]
-        matrix[3, 6:9] = normal
-        projected = matrix[:3, :3] @ centre
-        lower = np.r_[projected + [0.06, -0.09, -0.09], 0.3]
-        upper = np.r_[projected + [0.3, 0.09, 0.09], 5.0]
-        if self.GATE_SLACK_CAPS is not None:
-            caps = np.asarray(self.GATE_SLACK_CAPS, dtype=float)
+        ends = np.atleast_2d(ends)
+        good = np.ones(len(ends), bool)
+        delta = ends - a
+        for pole, radius in zip(self.poles, self.pole_r):
+            full_radius = radius
+            if escape:
+                radius = min(radius, max(0.12, np.linalg.norm(a[:2] - pole[:2]) - 0.005))
+            alpha = np.clip(
+                ((pole[:2] - a[:2]) * delta[:, :2]).sum(axis=1)
+                / np.maximum((delta[:, :2] ** 2).sum(axis=1), 1e-12),
+                0,
+                1,
+            )
+            nearest = a + alpha[:, None] * delta
+            good &= ~(
+                (np.linalg.norm(nearest[:, :2] - pole[:2], axis=1) < radius)
+                & (np.minimum(a[2], ends[:, 2]) < pole[2] + 0.12)
+            )
+            good &= (np.linalg.norm(ends[:, :2] - pole[:2], axis=1) >= full_radius) | (
+                ends[:, 2] >= pole[2] + 0.12
+            )
+        for center, rot, margin in zip(self.centers, self.rot, self.margin):
+            local = (a - center) @ rot
+            local_delta = delta @ rot
+            parallel = np.abs(local_delta) < 1e-10
+            safe_delta = np.where(parallel, 1.0, local_delta)
+            for box, half in [
+                ([0, 0, 0.28], [0.01, 0.36, 0.08]),
+                ([0, 0, -0.28], [0.01, 0.36, 0.08]),
+                ([0, -0.28, 0], [0.01, 0.08, 0.36]),
+                ([0, 0.28, 0], [0.01, 0.08, 0.36]),
+                ([0, 0, -0.86], [0.05, 0.05, 0.5]),
+            ]:
+                low = np.array(box) - np.array(half) - margin
+                high = np.array(box) + np.array(half) + margin
+                t1 = (low - local) / safe_delta
+                t2 = (high - local) / safe_delta
+                near = np.where(parallel, -np.inf, np.minimum(t1, t2)).max(axis=1)
+                far = np.where(parallel, np.inf, np.maximum(t1, t2)).min(axis=1)
+                outside = (parallel & ((local < low) | (local > high))).any(axis=1)
+                good &= ~((np.maximum(near, 0.0) <= np.minimum(far, 1.0)) & ~outside)
+        good &= ((ends >= self.lower) & (ends <= self.upper)).all(axis=1)
+        return good
+
+    def plan(self, pos: np.ndarray, goal: np.ndarray) -> list[np.ndarray]:
+        """Search a visibility graph with lazy A* and exact segment-box intersections."""
+        if self.clear_segments(pos, goal, escape=True)[0]:
+            return [goal.copy()]
+        nodes = [pos, goal]
+        heights = [goal[2], pos[2]]
+        for z in heights:
+            for pole, radius in zip(self.poles, self.pole_r):
+                for angle in np.arange(12) * np.pi / 6:
+                    nodes.append(
+                        np.array(
+                            [
+                                pole[0] + (radius + 0.10) * np.cos(angle),
+                                pole[1] + (radius + 0.10) * np.sin(angle),
+                                z,
+                            ]
+                        )
+                    )
+            for center, rot, margin in zip(self.centers, self.rot, self.margin):
+                for x in [-margin - 0.12, margin + 0.12]:
+                    for y in [-0.36 - margin - 0.12, 0.36 + margin + 0.12]:
+                        point = center + rot @ np.array([x, y, 0])
+                        point[2] = z
+                        nodes.append(point)
+        nodes = np.asarray(nodes)
+        distance = np.full(len(nodes), np.inf)
+        distance[0] = 0
+        prev = np.full(len(nodes), -1, int)
+        queue = [(np.linalg.norm(pos - goal), 0)]
+        visited = set()
+        while queue:
+            _, i = heapq.heappop(queue)
+            if i in visited:
+                continue
+            if i == 1:
+                break
+            visited.add(i)
+            ok = self.clear_segments(nodes[i], nodes, escape=(i == 0))
+            costs = distance[i] + np.linalg.norm(nodes - nodes[i], axis=1)
+            for j in np.flatnonzero(ok & (costs < distance)):
+                distance[j] = costs[j]
+                prev[j] = i
+                heapq.heappush(queue, (costs[j] + np.linalg.norm(nodes[j] - goal), int(j)))
+        if not np.isfinite(distance[1]):
+            self.failures += 1
+            return [pos.copy()]
+        route, idx = [], 1
+        while idx != 0:
+            route.append(nodes[idx])
+            idx = int(prev[idx])
+        return route[::-1]
+
+    def navigation(self, obs: dict, changed: bool) -> tuple[np.ndarray, float]:
+        """Take off, observe and align, cross the center, then clear the gate plane."""
+        pos = np.asarray(obs["pos"], float)
+        passed = int(obs["n_gates_passed"])
+        if passed >= len(obs["gate_sequence"]):
+            return pos, 0.0
+        reset_route = changed
+        if passed != self.passed:
+            center, normal = self.geometry(obs, self.passed)
+            self.target = center + 0.28 * normal
+            self.passed = passed
+            self.phase = "exit"
+            self.route = [self.target.copy()]
+        if self.phase == "takeoff":
+            if np.linalg.norm(pos - self.target) < 0.10:
+                self.phase = "approach"
+                reset_route = True
+            else:
+                return self.target, 0.65
+        if self.phase == "exit":
+            if np.linalg.norm(pos - self.target) > 0.04:
+                return self.target, 0.65
+            self.phase = "approach"
+            reset_route = True
+        center, normal = self.geometry(obs, passed)
+        if self.phase == "approach":
+            gid = int(obs["gate_sequence"][passed])
+            ready = False
+            if obs["gates_visited"][gid]:
+                # Choose a staging distance that also clears poles near the opening.
+                entries = [center - d * normal for d in [0.23, 0.20, 0.17, 0.14, 0.28, 0.34]]
+                feasible = [p for p in entries if self.clear_segments(p, center)[0]]
+                self.target = feasible[0] if feasible else entries[0]
+                ready = bool(feasible)
+            else:
+                self.target = center - 0.28 * normal
+            if not self.clear_segments(self.target, self.target)[0]:
+                lateral = self.rot[gid][:, 1]
+                candidates = [center - 0.30 * normal + s * 0.27 * lateral for s in [-1, 1]]
+                candidates += [center + 0.30 * normal + s * 0.27 * lateral for s in [-1, 1]]
+                feasible = [p for p in candidates if self.clear_segments(p, p)[0]]
+                if feasible:
+                    self.target = min(feasible, key=lambda p: np.linalg.norm(pos - p))
+                    ready = False
+            target_changed = self.route_goal is None or not np.allclose(
+                self.target, self.route_goal, atol=0.01
+            )
+            blocked = (
+                bool(self.route) and not self.clear_segments(pos, self.route[0], escape=True)[0]
+            )
+            incomplete = bool(self.route) and np.linalg.norm(self.route[-1] - self.target) > 0.01
             if (
-                caps.shape != (4,)
-                or not np.all(np.isfinite(caps))
-                or np.any(caps < 0)
-                or np.any(caps > [0.6, 0.05, 0.05, 2.0])
+                reset_route
+                or target_changed
+                or not self.route
+                or ((blocked or incomplete) and self.tick >= self.next_plan_tick)
             ):
-                raise ValueError("Gate relaxation exceeds the permitted outer corridor")
-            matrix = np.vstack([matrix, matrix])
-            lower = np.r_[lower, lower - caps]
-            upper = np.r_[upper, upper + caps]
-        self._solver.constraints_set(stage, "C", matrix, api="new")
-        self._solver.constraints_set(stage, "lg", lower)
-        self._solver.constraints_set(stage, "ug", upper)
-        self._gate_constraint_stage = stage
-        self._gate_constraint_stages = [stage]
-        # A post-plane box alone does not constrain the approach to the near
-        # frame. Add an earlier alignment stage only with sufficient lead time.
-        lead = self.GATE_APPROACH_STEPS
-        if lead and stage >= 2 * lead:
-            approach_stage = stage - lead
-            approach_lower = lower.copy()
-            approach_upper = upper.copy()
-            approach_lower[0] = projected[0] - 0.4
-            approach_upper[0] = projected[0] - 0.04
-            if rows == 8:
-                approach_lower[4] = approach_lower[0] - caps[0]
-                approach_upper[4] = approach_upper[0] + caps[0]
-            self._solver.constraints_set(approach_stage, "C", matrix, api="new")
-            self._solver.constraints_set(approach_stage, "lg", approach_lower)
-            self._solver.constraints_set(approach_stage, "ug", approach_upper)
-            self._gate_constraint_stages.append(approach_stage)
+                self.route = self.plan(pos, self.target)
+                self.route_goal = self.target.copy()
+                self.next_plan_tick = self.tick + max(1, round(0.5 / self.dt))
+            while len(self.route) > 1 and np.linalg.norm(pos - self.route[0]) < 0.06:
+                self.route.pop(0)
+            if (
+                ready
+                and np.linalg.norm(pos - self.target) < 0.05
+                and np.linalg.norm(obs["vel"]) < 0.25
+            ):
+                self.phase = "cross"
+                self.route = []
+            else:
+                return self.route[0], 0.95
+        self.target = center + 0.28 * normal
+        return self.target, 0.65
+
+    def compute_control(self, obs: dict, info: dict | None = None) -> np.ndarray:
+        """Return [roll, pitch, yaw, collective thrust], in radians and newtons."""
+        changed = self.update_map(obs)
+        goal, speed = self.navigation(obs, changed)
+        pos, vel = np.asarray(obs["pos"], float), np.asarray(obs["vel"], float)
+        measured = (vel - self.last_vel) / self.dt
+        self.last_vel = vel.copy()
+        self.accel = 0.7 * self.accel + 0.3 * measured
+        zaxis = Rotation.from_quat(obs["quat"]).as_matrix()[:, 2]
+        # Estimate mass using observed vertical impulse and the previous applied thrust.
+        if self.tick > 20 and pos[2] > 0.25 and abs(measured[2]) < 5 and zaxis[2] > 0.85:
+            estimate = self.last_action[3] * zaxis[2] / max(4.0, 9.81 + measured[2])
+            self.mass = 0.98 * self.mass + 0.02 * np.clip(
+                estimate, 0.75 * self.mass0, 1.25 * self.mass0
+            )
+        delta = goal - pos
+        distance = np.linalg.norm(delta)
+        direction = delta / max(distance, 1e-8)
+        # Build position/velocity references, braking as the waypoint approaches.
+        ref = np.zeros((self.n, 3, 3))
+        state = np.stack([pos, vel, self.accel])
+        limits = np.array([2.5, 2.5, 3.0])
+        # Limit requested speed by a reachable position reference over the horizon.
+        vref = direction * min(speed, 2.0 * distance)
+        tt = np.arange(1, self.n + 1) * self.h
+        travel = np.minimum(np.linalg.norm(vref) * tt, distance)
+        ref[:, 0, :] = pos + travel[:, None] * direction
+        ref[:, 1, :] = vref
+        ref[travel >= distance, 1, :] = 0
+        acceleration = self.solve_mpc(state, ref, limits)
+        force = acceleration + np.array([0.0, 0.0, 9.81])
+        pitch = np.arctan2(force[0], force[2])
+        roll = np.arctan2(-force[1], np.hypot(force[0], force[2]))
+        thrust = self.mass * np.dot(force, zaxis)
+        action = np.array(
+            [
+                np.clip(roll, -0.35, 0.35),
+                np.clip(pitch, -0.35, 0.35),
+                0.0,
+                np.clip(thrust, *self.thrust_bounds),
+            ],
+            dtype=np.float32,
+        )
+        self.last_action = action.copy()
+        self.tick += 1
+        return action
+
+    def solve_mpc(self, state: np.ndarray, reference: np.ndarray, limits: np.ndarray) -> np.ndarray:
+        """Approximately minimize the box-constrained condensed quadratic objective.
+
+        Cost: position/velocity/acceleration tracking plus command magnitude and
+        within-horizon command differences. Projected-gradient refinement starts
+        at the clipped unconstrained optimum and has a fixed iteration budget.
+        Only the first planned command is used; the problem is rebuilt next tick.
+        """
+        gradient = self.GQ @ (self.F @ state - reference.reshape(3 * self.n, 3))
+        self.u = np.clip(-self.invH @ gradient, -limits, limits)
+        for _ in range(12):
+            self.u = np.clip(self.u - (self.H @ self.u + gradient) / self.L, -limits, limits)
+        return self.u[0].copy()
 
     def step_callback(
         self,
-        action: NDArray,
+        action: np.ndarray,
         obs: dict,
         reward: float,
         terminated: bool,
         truncated: bool,
         info: dict,
     ) -> bool:
-        """Continue until the environment ends the race or repeated solver failures occur."""
-        self._tick += 1
-        if self._trajectory is not None:
-            self._trajectory._time += self._dt
-        finished = bool(terminated or truncated or self._failures >= 25)
-        if (
-            self.RACING
-            and finished
-            and int(obs["n_gates_passed"]) < len(obs["gate_sequence"])
-            and self._last_observation is not None
-        ):
-            self._report_failure(obs)
-        return finished
+        """Finish only when every configured gate-order entry has been passed."""
+        return int(obs["n_gates_passed"]) >= len(obs["gate_sequence"])
 
-    def _report_failure(self, obs: dict) -> None:
-        """Expose last valid flight geometry in local logs and CI annotations."""
-        previous = self._last_observation
-        position = np.asarray(previous["pos"])
-        local = np.einsum(
-            "gi,gij->gj",
-            position - previous["gates_pos"],
-            Rotation.from_quat(previous["gates_quat"]).as_matrix(),
-        )
-        distance = np.linalg.norm(np.maximum(np.abs(local) - [0.018, 0.36, 0.36], 0), axis=1)
-        closest = int(np.argmin(distance))
-        report = {
-            "time": round(self._tick * self._dt, 3),
-            "gates_passed": int(obs["n_gates_passed"]),
-            "closest_gate": closest,
-            "local_position": np.round(local[closest], 3).tolist(),
-            "velocity": np.round(previous["vel"], 3).tolist(),
-            "reference_error": np.round(self._last_reference_position - position, 3).tolist(),
-            "solver_failures": self._failures,
-        }
-        print(f"::notice title=MPC flight failure::{json.dumps(report)}", flush=True)
+    def render_callback(self, sim: Sim):
+        """Display the current route and gate target in the simulation viewer."""
+        from crazyflow.sim.visualize import draw_line, draw_points
+
+        draw_points(sim, self.target.reshape(1, 3), rgba=(1.0, 0.2, 0.1, 1.0), size=0.025)
+        if len(self.route) > 1:
+            draw_line(sim, np.asarray(self.route), rgba=(0.1, 0.8, 0.2, 1.0))

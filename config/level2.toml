@@ -4,7 +4,7 @@
 # | :-----------------: | :----------------------------: | :-------------------------: | :---------------: | :-------------------: |
 # | `level2.toml`       | *Yes*                          | *Yes*                       | *No*              | Learning, re-planning |
 [controller]
-file = "level2_mpc.py" # Controllers are located in lsy_drone_racing/control/.
+file = "level2_sprint.py" # Portable distance-scheduled controller; see docs/control/level2_sprint.md.
 
 [deploy]
 ### Settings only relevant for deployment
