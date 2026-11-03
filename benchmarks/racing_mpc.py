@@ -82,9 +82,7 @@ def main() -> None:
     profile = json.loads(args.profile.read_text()) if args.profile else {}
     trajectory_module = sys.modules.get("lsy_drone_racing.control.racing_trajectory")
     if trajectory_module is None:
-        trajectory_module = importlib.import_module(
-            "lsy_drone_racing.control.racing_trajectory"
-        )
+        trajectory_module = importlib.import_module("lsy_drone_racing.control.racing_trajectory")
     trajectory_cls = trajectory_module.RaceTrajectory
     for cls, settings in (
         (controller_cls, profile.get("controller", {})),
