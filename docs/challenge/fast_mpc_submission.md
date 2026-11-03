@@ -30,9 +30,15 @@ grid remain in use. The base controller's deadline calculation is extracted into
 a method with identical default behavior. All 18 focused MPC tests pass.
 
 The fork's Candidate Qualification workflow runs the unchanged 20-race evaluator
-on Ubuntu using the locked Pixi environment. Before promotion it requires at
-least 15/20 finishes and a mean successful lap below 7 seconds. This is a margin
-for development; central qualification remains an independent 20-race run.
+on Ubuntu using the locked Pixi environment. It additionally checks a stronger
+development target of 15/20 finishes below 7 seconds.
+
+On 3 November, candidate `a51f3fc` completed **11/20 races (55%)**, averaging
+**6.70727 seconds**. It passed the unchanged official evaluator's 50% minimum,
+but failed the additional 75% development target. This is a borderline eligible
+candidate, not a robust qualification claim. It is submitted in accordance with
+the request to publish faster eligible results; central evaluation remains an
+independent 20-race run. No success threshold or protected evaluator was changed.
 
 The current central anti-cheat checker passes against upstream main. The protected
 simulation, evaluator and dispatch workflow match upstream; only the permitted
