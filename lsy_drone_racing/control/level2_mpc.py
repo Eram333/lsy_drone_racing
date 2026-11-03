@@ -312,9 +312,7 @@ class Level2MPC(Controller):
         rotation = Rotation.from_quat(obs["gates_quat"][index]).as_matrix()
         normal = rotation[:, 0] * int(obs["gate_sequence_direction"][progress])
         distance = max(0.0, -(np.asarray(obs["pos"]) - centre) @ normal)
-        remaining = float(
-            np.sum(self._trajectory._variables[: progress + 1]) - self._trajectory._time
-        )
+        remaining = self._gate_remaining_time(progress)
         deadline = max(remaining, 0.2, np.sqrt(2 * distance / 8))
         if deadline > (self._N - 1) * self._prediction_dt:
             self._gate_constraint_stage = None
@@ -332,6 +330,10 @@ class Level2MPC(Controller):
         self._solver.constraints_set(stage, "lg", lower)
         self._solver.constraints_set(stage, "ug", upper)
         self._gate_constraint_stage = stage
+
+    def _gate_remaining_time(self, progress: int) -> float:
+        """Return the planned time remaining until the current signed crossing."""
+        return float(np.sum(self._trajectory._variables[: progress + 1]) - self._trajectory._time)
 
     def step_callback(
         self,

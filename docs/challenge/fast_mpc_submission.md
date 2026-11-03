@@ -1,15 +1,38 @@
 # Faster MPC leaderboard submission
 
-The level-2 configuration selects `level2_mpc_fast.py`, which inherits the accepted
-racing MPC and uses the previously explored `TIME_SCALE = 1.4`. The original
-`level2_mpc.py` retains its 1.8 setting for comparison. No experimental SMPC or RL
-changes are included.
+The candidate configuration selects `level2_mpc_guarded.py`, which inherits the
+accepted racing MPC at `TIME_SCALE = 1.4`. It adjusts reference progress only
+when observed gate alignment is poor. The original `level2_mpc.py` retains its
+1.8 setting and default behavior. No RL or alternative-dynamics changes are included.
 
 The unchanged official 20-race evaluator on 2 November 2026 completed **16/20
 races (80%)**, averaging **6.65 seconds** over successful races. This is a fresh
 randomized batch; the older 6.50-second result is not a guaranteed lap time.
 The existing central personal best before submission was 8.47765 seconds at 85%.
 Central validation and the leaderboard update are separate from the local pass.
+
+The central evaluation of `a798cdd` subsequently finished only **9/20 races
+(45%)**, below the 50% requirement; the leaderboard was not updated. Setup,
+anti-cheat and whitelist checks passed. Reported failures clustered around gate
+frames, so the faster timing alone is not a qualified competition result.
+
+The reference governor estimates lateral/vertical alignment time using public
+position, velocity and observed gate geometry. A 12 cm approach allowance accounts
+for possible frame contact before the centre crossing. Poor alignment reduces the
+internal reference rate, bounded between 0.6 and 1.0, with gradual recovery. This
+is a ballistic heuristic, not a collision-avoidance guarantee.
+
+Prediction offsets, velocity/acceleration references and crossing deadlines use
+the current reference rate. Only the internal trajectory clock changes: the
+environment frequency, elapsed simulation time, race step count and success
+criterion are unchanged. The original dynamics, input limits and 20 x 40 ms MPC
+grid remain in use. The base controller's deadline calculation is extracted into
+a method with identical default behavior. All 18 focused MPC tests pass.
+
+The fork's Candidate Qualification workflow runs the unchanged 20-race evaluator
+on Ubuntu using the locked Pixi environment. Before promotion it requires at
+least 15/20 finishes and a mean successful lap below 7 seconds. This is a margin
+for development; central qualification remains an independent 20-race run.
 
 The current central anti-cheat checker passes against upstream main. The protected
 simulation, evaluator and dispatch workflow match upstream; only the permitted

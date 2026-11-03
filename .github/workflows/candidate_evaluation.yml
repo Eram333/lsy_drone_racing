@@ -1,0 +1,48 @@
+name: Candidate Qualification
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: candidate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.9.3
+        with:
+          pixi-version: v0.70.0
+          cache: true
+          cache-write: false
+          activate-environment: false
+          locked: true
+      - name: Run unchanged 20-race evaluation
+        run: pixi run --locked evaluate 2>&1 | tee candidate_evaluation.log
+      - name: Require qualification margin at six-second pace
+        run: |
+          pixi run --locked python - <<'PY'
+          import csv
+          with open('evaluation.csv') as f:
+              row = next(csv.reader(f))
+          lap_time, success_rate = float(row[0]), float(row[1])
+          print(f'Mean successful lap: {lap_time:.3f} s; success: {success_rate:.0%}')
+          assert success_rate >= 0.75, 'Require at least 15/20 finishes before submission'
+          assert 0 < lap_time < 7.0, 'Keep the six-second controller target'
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: candidate-evaluation
+          path: |
+            evaluation.csv
+            candidate_evaluation.log
+          if-no-files-found: ignore
